@@ -28,8 +28,16 @@ done
 
 scratch=$(mktemp -d "$TG_RUNTIME/telegram-audio-test.XXXXXX")
 recorder=
+owner_pid=
+owner_fd=
+native_fd=
+sandbox_pid=
 cleanup() {
 	if [[ -n $recorder ]]; then kill "$recorder" 2>/dev/null || true; wait "$recorder" 2>/dev/null || true; fi
+	if [[ -n $sandbox_pid ]]; then kill -KILL -- "$sandbox_pid" 2>/dev/null || true; fi
+	if [[ -n $owner_fd ]]; then exec {owner_fd}>&-; fi
+	if [[ -n $native_fd ]]; then exec {native_fd}>&-; fi
+	if [[ -n $owner_pid ]]; then kill "$owner_pid" 2>/dev/null || true; wait "$owner_pid" 2>/dev/null || true; fi
 	tg_audio_stop
 	rm -rf -- "$scratch"
 }
@@ -77,5 +85,42 @@ playback_rms=$(rms "$scratch/playback.wav")
 awk -v value="$playback_rms" 'BEGIN { exit !(value>0.005) }'
 tg_audio_stop
 [[ ! -e $broker_dir ]] && ! kill -0 "$broker_pid" 2>/dev/null
+
+# The initial application may exit while its relaunched child remains in the
+# namespace. The native sync pipe, rather than that first PID, owns playback.
+mkfifo "$scratch/relaunch-finish"
+exec {native_fd}> >(cat > /dev/null; : > "$scratch/native-released")
+native_pid=$!
+coproc TG_OWNER_TEST { tg_audio_sandbox "$native_fd"; }
+owner_pid=$TG_OWNER_TEST_PID
+exec {owner_fd}> "/proc/self/fd/${TG_OWNER_TEST[1]}"
+input_fd=${TG_OWNER_TEST[1]}
+notification_fd=${TG_OWNER_TEST[0]}
+exec {input_fd}>&-
+exec {native_fd}>&-
+native_fd=
+IFS= read -r -t 60 -u "$notification_fd" owner_socket
+exec {notification_fd}<&-
+owner_dir=${owner_socket%/native}
+# Closing all extra descriptors is essential: the audio server and its EOF
+# reader must not inherit a copy that keeps this lifetime pipe open forever.
+exec {sandbox_info_fd}> "$scratch/sandbox-info"
+bwrap --ro-bind / / --dev /dev --unshare-user --unshare-pid --sync-fd "$owner_fd" --info-fd "$sandbox_info_fd" -- \
+	/bin/sh -c '(cat "$1" > /dev/null) & exit 0' telegram-relaunch "$scratch/relaunch-finish"
+exec {sandbox_info_fd}>&-
+sandbox_pid=$(sed -n 's/.*"child-pid": *\([0-9]*\).*/\1/p' "$scratch/sandbox-info")
+[[ $sandbox_pid =~ ^[0-9]+$ ]]
+exec {owner_fd}>&-
+owner_fd=
+kill -0 "$owner_pid"
+[[ ! -e $scratch/native-released ]]
+pactl --server="unix:$owner_socket" info > /dev/null
+printf 'finish\n' > "$scratch/relaunch-finish"
+wait "$owner_pid"
+owner_pid=
+sandbox_pid=
+wait "$native_pid"
+[[ ! -e $owner_dir && -e $scratch/native-released ]]
 printf 'provider=%s host-input-rms=%s playback-rms=%s microphone-isolated=yes module-loading-denied=yes cleanup=yes\n' \
 	"$TG_AUDIO_PROVIDER" "$host_rms" "$playback_rms"
+printf 'same-sandbox-relaunch=playback-retained native-sync=preserved final-cleanup=yes\n'

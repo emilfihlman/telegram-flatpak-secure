@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 # A private native Pulse server withholds microphones and retains playback.
 
+tg_audio_close_fds() {
+	local descriptor
+	for descriptor in /proc/self/fd/*; do
+		descriptor=${descriptor##*/}
+		[[ $descriptor =~ ^[0-9]+$ ]] || continue
+		(( descriptor > 2 )) || continue
+		[[ $descriptor != "${1:-}" ]] || continue
+		exec {descriptor}>&-
+	done
+}
+
 tg_audio_supported() {
 	local module modules
 	command -v setpriv >/dev/null && command -v setsid >/dev/null || return 1
@@ -96,6 +107,9 @@ EOF
 	# Private configs load no capture hardware or host rules that undo isolation.
 	# Readiness and process exit are native events; no socket polling is needed.
 	coproc TG_AUDIO_READY {
+		# Only this server's readiness pipes belong in the audio process.
+		# In a Flatpak hook, inherited descriptors also control native proxies.
+		tg_audio_close_fds
 		export XDG_RUNTIME_DIR=$TG_RUNTIME
 		export PULSE_RUNTIME_PATH=$TG_AUDIO_DIR
 		if [[ $TG_AUDIO_PROVIDER == pulseaudio ]]; then
@@ -154,4 +168,38 @@ EOF
 	if [[ $TG_AUDIO_PROVIDER == pulseaudio ]]; then exec {input_fd}>&-; fi
 	exec {notification_fd}<&-
 	[[ -S $TG_AUDIO_SOCKET ]] || { tg_audio_stop; return 1; }
+}
+
+# Bubblewrap keeps a pipe open for the whole sandbox, including a Telegram
+# relaunch in the same PID namespace. Bridge its existing native sync handle
+# so Flatpak's own D-Bus proxy lifetime remains unchanged.
+tg_audio_sandbox() {
+	local native_sync_fd=${1:-} lifetime_pid='' finished status=0
+	tg_audio_close_fds "$native_sync_fd"
+	cleanup() {
+		if [[ -n $native_sync_fd ]]; then exec {native_sync_fd}>&-; native_sync_fd=; fi
+		if [[ -n $lifetime_pid ]]; then
+			kill -TERM -- "$lifetime_pid" 2>/dev/null || true
+			wait "$lifetime_pid" 2>/dev/null || true
+		fi
+		tg_audio_stop
+	}
+	trap cleanup EXIT
+	trap 'exit 129' HUP
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	trap 'exit 141' PIPE
+	tg_audio_start || exit 1
+	printf '%s\n' "$TG_AUDIO_SOCKET"
+	exec 1>&-
+	(tg_audio_close_fds; IFS= read -r _ || true) <&0 &
+	lifetime_pid=$!
+	wait -n -p finished "$TG_AUDIO_PID" "$lifetime_pid" || status=$?
+	if [[ $finished == "$TG_AUDIO_PID" ]]; then
+		TG_AUDIO_PID=
+		printf 'Error: Telegram audio stopped unexpectedly.\n' >&2
+		exit 1
+	fi
+	lifetime_pid=
+	exit "$status"
 }

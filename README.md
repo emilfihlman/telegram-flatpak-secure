@@ -7,16 +7,16 @@ Telegram Desktop from Flathub, with configurable camera and microphone access.
 ```mermaid
 flowchart LR
 	installed["Existing Flatpak<br/>Telegram + runtime"]
-	wrapper["Launch overrides<br/>+ bubblewrap hook"]
+	wrapper["Our launcher + hook<br/>Applies access rules"]
 	cameras["Camera allowlist<br/>Selected / all / none"]
 	audio["Audio access<br/>Mic on / playback only"]
 	subgraph sandbox["Flatpak's bubblewrap sandbox"]
 		telegram["Telegram Desktop"]
 	end
 	installed --> wrapper
-	wrapper --> telegram
-	cameras -->|Approved devices| telegram
-	audio -->|Approved socket| telegram
+	cameras --> wrapper
+	audio --> wrapper
+	wrapper -->|Only approved access| telegram
 ```
 
 The launcher customizes **Flatpak's own sandbox at each launch**, using permission overrides and a bubblewrap hook. It removes broad filesystem, device and host-service access, then adds the approved camera devices and audio socket. Linux namespaces and bind mounts control what Telegram can see and access. The configured profile, Telegram downloads, network, GPU and desktop display remain available; microphone blocking keeps sound playback available.

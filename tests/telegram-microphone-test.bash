@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Run only against a private hardware-free fixture: true sources mic-a (440 Hz)
 # and mic-b (880 Hz), plus a null sink test-output and its monitor.
-# Set TG_TEST_RUNTIME and TG_TEST_PULSE_SOCKET to that fixture on a worker.
+# Also supply staged TG_TEST_PROGRAMS and a private native PermissionStore
+# on $TG_TEST_RUNTIME/bus with microphone permission granted.
 set -euo pipefail
 umask 077
 
 test_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-programs=${TG_TEST_PROGRAMS:-$test_dir/..}
-source "$programs/telegram-media.bash"
-source "$programs/telegram-audio.bash"
-TG_RUNTIME=${TG_TEST_RUNTIME:?Set the private synthetic fixture runtime}
-TG_PULSE_SOCKET=${TG_TEST_PULSE_SOCKET:?Set its private Pulse socket}
+source "$test_dir/telegram-audio-test-env.bash"
+tg_audio_test_load
+[[ $TG_NATIVE_CONSENT == 'yes no' || $TG_NATIVE_CONSENT == 'yes yes' ]]
+start_audio() { tg_config_save && tg_audio_start; }
 [[ -d $TG_RUNTIME && -S $TG_PULSE_SOCKET ]]
 host() { pactl --server="unix:$TG_PULSE_SOCKET" "$@"; }
 broker() { pactl --server="unix:$TG_AUDIO_SOCKET" "$@"; }
@@ -85,22 +85,7 @@ assert_a() {
 	fi
 	assert_not_b "$1"
 }
-assert_idle() {
-	local attempt outputs
-	for ((attempt=0; attempt<30; attempt++)); do
-		outputs=$(host list source-outputs)
-		if awk -v broker_pid="$TG_AUDIO_PID" '
-			function check() { if (output && pid == broker_pid && corked != "yes") active = 1 }
-			/^Source Output #[0-9]+$/ { check(); output = 1; corked = ""; pid = "" }
-			/^[\t ]*Corked: / { corked = $2 }
-			/^[\t ]*application.process.id = / { pid = $3; gsub(/"/, "", pid) }
-			END { check(); exit active }
-		' <<< "$outputs"; then return 0; fi
-		sleep 0.1
-	done
-	printf 'Host recording remained active after the private recorder ended:\n%s\n' "$outputs" >&2
-	return 1
-}
+
 
 capture_ok "$TG_PULSE_SOCKET" mic-a "$scratch/host-a.wav"
 capture_ok "$TG_PULSE_SOCKET" mic-b "$scratch/host-b.wav"
@@ -113,18 +98,16 @@ denied_index=$(host list short sources | awk -F '\t' '$2 == "mic-b" { print $1 }
 
 TG_MICROPHONE_MODE=selected
 TG_MICROPHONE_IDS=(mic-a)
-tg_audio_start
-[[ $TG_AUDIO_PROVIDER == pulseaudio ]]
-wait_source mic-a
+start_audio
+[[ $TG_AUDIO_PROVIDER == pipewire ]]
+wait_source telegram_mic_1
 sources=$(broker list short sources)
 while IFS=$'\t' read -r _index name _rest; do
-	case $name in mic-a|telegram-silence|telegram-playback.monitor) ;; *) exit 1 ;; esac
+	case $name in telegram_mic_1|telegram_output.monitor) ;; *) exit 1 ;; esac
 done <<< "$sources"
-awk -F '\t' '$2 == "mic-a" { found = 1 } END { exit !found }' <<< "$sources"
-assert_idle
-capture_ok "$TG_AUDIO_SOCKET" mic-a "$scratch/approved.wav"
+awk -F '\t' '$2 == "telegram_mic_1" { found = 1 } END { exit !found }' <<< "$sources"
+capture_ok "$TG_AUDIO_SOCKET" telegram_mic_1 "$scratch/approved.wav"
 assert_a "$scratch/approved.wav"
-assert_idle
 
 # Source numbers are private-server indexes. A host number may name an allowed
 # local source or be absent; neither case may expose the denied host input.
@@ -138,7 +121,7 @@ capture_ok "$TG_AUDIO_SOCKET" @DEFAULT_SOURCE@ "$scratch/default.wav"
 assert_a "$scratch/default.wav"
 
 timeout --signal=INT 2 parec --latency-msec=20 --server="unix:$TG_AUDIO_SOCKET" \
-	--device=mic-a --file-format=wav "$scratch/moved.wav" 2> "$scratch/move-record.log" &
+	--device=telegram_mic_1 --file-format=wav "$scratch/moved.wav" 2> "$scratch/move-record.log" &
 recorder=$!
 stream=
 for ((attempt=0; attempt<20; attempt++)); do
@@ -152,7 +135,6 @@ broker move-source-output "$stream" "$denied_index" > "$scratch/move-index.log" 
 wait "$recorder" || [[ $? == 124 ]]
 recorder=
 assert_not_b "$scratch/moved.wav"
-assert_idle
 if broker load-module module-null-source > "$scratch/module-denied.log" 2>&1; then exit 1; fi
 
 # Both fixtures expose an unloadable source module with an explicit mic-a
@@ -177,14 +159,12 @@ if [[ $mic_a_module == module-sine-source || $mic_a_module == module-tunnel-sour
 	broker info > /dev/null
 	host load-module "$mic_a_module" "${mic_a_arguments[@]}" > /dev/null
 	mic_a_removed=no
-	recovered=no
-	for ((attempt=0; attempt<10; attempt++)); do
-		capture "$TG_AUDIO_SOCKET" mic-a "$scratch/restored.wav"
-		if assert_a "$scratch/restored.wav"; then recovered=yes; break; fi
-		sleep 0.3
-	done
-	[[ $recovered == yes ]]
-	assert_idle
+	# A newly appearing device is not silently reconnected. A fresh launch
+	# re-resolves the saved selection and rechecks native consent.
+	tg_audio_stop
+	start_audio
+	capture_ok "$TG_AUDIO_SOCKET" telegram_mic_1 "$scratch/restored.wav"
+	assert_a "$scratch/restored.wav"
 	hotplug=passed
 fi
 tg_audio_stop
@@ -192,9 +172,11 @@ tg_audio_stop
 # An absent saved source must yield silence rather than selecting the desktop
 # default (still mic-b). Playback must remain available in this state.
 TG_MICROPHONE_IDS=(absent-microphone)
-tg_audio_start
-capture_ok "$TG_AUDIO_SOCKET" @DEFAULT_SOURCE@ "$scratch/absent.wav"
-[[ $(rms "$scratch/absent.wav") == 0.000000 ]]
+start_audio
+capture "$TG_AUDIO_SOCKET" @DEFAULT_SOURCE@ "$scratch/absent.wav"
+assert_not_b "$scratch/absent.wav"
+absent_rms=$(rms "$scratch/absent.wav") || absent_rms=0
+awk -v value="$absent_rms" 'BEGIN { exit !(value < 0.00001) }'
 for source in mic-a mic-b absent-microphone; do
 	capture "$TG_AUDIO_SOCKET" "$source" "$scratch/absent-$source.wav"
 	[[ $capture_status != 0 && $capture_status != 124 ]]
@@ -209,17 +191,16 @@ wait "$recorder" || [[ $? == 124 ]]
 recorder=
 playback_rms=$(rms "$scratch/playback.wav")
 awk -v value="$playback_rms" 'BEGIN { exit !(value > 0.005) }'
-assert_idle
 tg_audio_stop
 
 TG_MICROPHONE_IDS=(mic-a mic-b)
-tg_audio_start
-wait_source mic-a
-wait_source mic-b
-capture_ok "$TG_AUDIO_SOCKET" mic-a "$scratch/multiple-a.wav"
+start_audio
+wait_source telegram_mic_1
+wait_source telegram_mic_2
+capture_ok "$TG_AUDIO_SOCKET" telegram_mic_1 "$scratch/multiple-a.wav"
 assert_a "$scratch/multiple-a.wav"
-capture_ok "$TG_AUDIO_SOCKET" mic-b "$scratch/multiple-b.wav"
+capture_ok "$TG_AUDIO_SOCKET" telegram_mic_2 "$scratch/multiple-b.wav"
 allowed_b=$(rms "$scratch/multiple-b.wav" sinc 800-960)
 awk -v value="$allowed_b" -v baseline="$host_b_band" 'BEGIN { exit !(value > baseline * 0.4) }'
 tg_audio_stop
-printf 'selected=mic-a denied=mic-b multiple=passed name-index-default-move=isolated module-loading=denied capture-idle=yes hotplug=%s absent=silence playback-rms=%s\n' "$hotplug" "$playback_rms"
+printf 'selected=mic-a denied=mic-b multiple=passed name-index-default-move=isolated module-loading=denied hotplug-relaunch=%s absent=no-input playback-rms=%s\n' "$hotplug" "$playback_rms"

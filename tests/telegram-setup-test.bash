@@ -25,28 +25,17 @@ printf 'account\n' > "$TG_DATA/TelegramDesktop/tdata/preserved"
 printf 'download\n' > "$TG_HOME/Downloads/preserved"
 old_files=$(sha256sum "$TG_INSTALL_DIR/"*)
 old_settings=$(sha256sum "$TG_CONFIG_FILE")
-TG_SETUP_PREVIOUS_CAMERA_MODE=none
-TG_SETUP_PERMISSION_CHANGED=no
 TG_SETUP_KEEP_WORK=no
-INJECT_PERMISSION_FAILURE=no
 flatpak() {
 	printf '%s\n' "$*" >> "$scratch/flatpak-operations"
-	[[ $INJECT_PERMISSION_FAILURE != yes || $1 != permission-set ]]
+	return 90
 }
 tg_desktop_prepare() { :; }
 tg_desktop_apply() { :; }
-# A failed permission change cannot erase a working install or saved choices.
+# Setup preserves native consent; it must not write permission-set during commit.
 TG_CAMERA_MODE=all
-tg_setup_stage
-INJECT_PERMISSION_FAILURE=yes
-if tg_setup_commit; then exit 1; fi
-[[ $(sha256sum "$TG_INSTALL_DIR/"*) == "$old_files" ]]
-[[ $(sha256sum "$TG_CONFIG_FILE") == "$old_settings" ]]
-INJECT_PERMISSION_FAILURE=no
-tg_setup_cleanup
 # Atomic settings replacement can fail after directory exchange. Keep the old
 # complete program directory and settings, and remove only temporary output.
-INJECT_PERMISSION_FAILURE=no
 tg_setup_stage
 native_mv=$(type -P mv)
 mv() {
@@ -60,7 +49,6 @@ tg_setup_cleanup
 [[ ! -e $TG_SETUP_WORK ]]
 unset -f mv
 # A completed repeat setup applies new choices and leaves no old program copy.
-TG_SETUP_PERMISSION_CHANGED=no
 tg_setup_stage
 tg_setup_commit
 tg_setup_cleanup
@@ -68,11 +56,15 @@ tg_config_load required
 [[ $TG_CAMERA_MODE == all && $TG_MICROPHONE_MODE == none ]]
 cmp -s telegram-run.bash "$TG_INSTALL_DIR/telegram-run.bash"
 [[ ! -e $TG_SETUP_WORK ]]
+[[ ! -e $scratch/flatpak-operations ]]
+for file in telegram-consent.bash telegram-dbus-proxy.bash telegram-audio-broker.bash telegram-microphones.bash; do
+	[[ -x $TG_INSTALL_DIR/$file ]]
+	cmp -s "$file" "$TG_INSTALL_DIR/$file"
+done
 # A signal immediately after the atomic directory exchange follows the same
 # cleanup path, preserving the previous complete wrapper and choices.
 old_files=$(sha256sum "$TG_INSTALL_DIR/"*)
 old_settings=$(sha256sum "$TG_CONFIG_FILE")
-TG_SETUP_PREVIOUS_CAMERA_MODE=all
 status=0
 (
 	trap 'tg_setup_cleanup' EXIT
@@ -88,6 +80,15 @@ status=0
 [[ $status == 143 ]]
 [[ $(sha256sum "$TG_INSTALL_DIR/"*) == "$old_files" ]]
 [[ $(sha256sum "$TG_CONFIG_FILE") == "$old_settings" ]]
+# The previous private PulseAudio runtime is a recognized disposable upgrade.
+mkdir -- "$TG_INSTALL_DIR/pulseaudio"
+printf 'telegram-flatpak-secure\n' > "$TG_INSTALL_DIR/pulseaudio/owner"
+printf 'old runtime\n' > "$TG_INSTALL_DIR/pulseaudio/disposable"
+tg_setup_stage
+tg_setup_commit
+tg_setup_cleanup
+[[ ! -e $TG_INSTALL_DIR/pulseaudio ]]
+[[ ! -e $scratch/flatpak-operations ]]
 # Refuse to discard unrelated content during directory replacement.
 printf 'useful\n' > "$TG_INSTALL_DIR/unrelated"
 if tg_setup_stage 2>/dev/null; then exit 1; fi
@@ -107,7 +108,6 @@ tg_profile_choose > /dev/null <<< 1
 # First install failure removes only its newly installed program tree.
 rm -rf -- "$TG_INSTALL_DIR"
 TG_CONFIG_FILE=$TG_CONFIG/fresh-settings
-TG_SETUP_PREVIOUS_CAMERA_MODE=
 tg_setup_stage
 mv() {
 	if [[ ${!#} == "$TG_CONFIG_FILE" ]]; then return 73; fi

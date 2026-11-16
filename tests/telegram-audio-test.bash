@@ -2,14 +2,18 @@
 # Run on a worker against a private, hardware-free Pulse fixture. Its output
 # sink is telegram-test-output; its live synthetic input is telegram-test-input
 # (PulseAudio sine source) or telegram-test-input.monitor (PipeWire null sink).
-# Set TG_TEST_RUNTIME, TG_TEST_PULSE_SOCKET and TG_TEST_SOURCE to that fixture.
+# Also supply staged TG_TEST_PROGRAMS and a private native PermissionStore
+# on $TG_TEST_RUNTIME/bus with microphone permission denied.
 set -euo pipefail
 umask 077
 
 test_dir=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-source "$test_dir/../telegram-audio.bash"
-TG_RUNTIME=${TG_TEST_RUNTIME:?Set the private synthetic fixture runtime}
-TG_PULSE_SOCKET=${TG_TEST_PULSE_SOCKET:?Set its private Pulse socket}
+source "$test_dir/telegram-audio-test-env.bash"
+tg_audio_test_load
+[[ $TG_NATIVE_CONSENT == 'no no' || $TG_NATIVE_CONSENT == 'no yes' ]]
+TG_MICROPHONE_MODE=none
+TG_MICROPHONE_IDS=()
+tg_config_save
 test_source=${TG_TEST_SOURCE:?Set its synthetic input source}
 [[ $test_source == telegram-test-input || $test_source == telegram-test-input.monitor ]]
 [[ -d $TG_RUNTIME && -S $TG_PULSE_SOCKET ]]
@@ -62,12 +66,8 @@ status=0
 timeout --signal=INT 1 parec --latency-msec=30 --server="unix:$TG_AUDIO_SOCKET" \
 	--device="$test_source" --file-format=wav "$scratch/forbidden.wav" 2>"$scratch/denied.log" || status=$?
 [[ $status != 0 && $status != 124 ]]
-if [[ $TG_AUDIO_PROVIDER == pulseaudio ]]; then
-	capture "$TG_AUDIO_SOCKET" telegram-silence "$scratch/silence.wav"
-	[[ $(rms "$scratch/silence.wav") == 0.000000 ]]
-else
-	grep -q 'Access denied' "$scratch/denied.log"
-fi
+[[ $TG_AUDIO_PROVIDER == pipewire ]]
+grep -q 'Access denied' "$scratch/denied.log"
 if pactl --server="unix:$TG_AUDIO_SOCKET" load-module module-null-source >"$scratch/module.log" 2>&1; then
 	printf 'Private audio server allowed client module loading.\n' >&2
 	exit 1
@@ -101,7 +101,7 @@ exec {native_fd}>&-
 native_fd=
 IFS= read -r -t 60 -u "$notification_fd" owner_socket
 exec {notification_fd}<&-
-owner_dir=${owner_socket%/native}
+owner_dir=${owner_socket%/pulse/native}
 # Closing all extra descriptors is essential: the audio server and its EOF
 # reader must not inherit a copy that keeps this lifetime pipe open forever.
 exec {sandbox_info_fd}> "$scratch/sandbox-info"

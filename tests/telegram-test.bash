@@ -164,19 +164,48 @@ tg_stop() { :; }
 tg_remove > /dev/null
 [[ ! -e $TG_CONFIG_FILE && ! -e $TG_DESKTOP && ! -e $TG_INSTALL_DIR/telegram-run.bash ]]
 [[ -f $TG_DATA/TelegramDesktop/tdata/preserved && -f $scratch/downloads/preserved ]]
-grep -q 'permission-remove devices camera org.telegram.desktop' "$scratch/flatpak-operations"
+[[ ! -e $scratch/flatpak-operations ]]
 # Exercise the actual native metadata parser, including namespace roots.
 : > "$scratch/app-info"
 exec {metadata_fd}< "$scratch/app-info"
-printf '%s\0' --setenv TELEGRAM_WRAPPER telegram-sandbox --ro-bind-data "$metadata_fd" /.flatpak-info > "$scratch/arguments"
+printf '%s\0' --setenv TELEGRAM_WRAPPER telegram-sandbox \
+	--setenv TELEGRAM_MICROPHONE_CONSENT no --setenv TELEGRAM_CAMERA_CONSENT no \
+	--ro-bind-data "$metadata_fd" /.flatpak-info > "$scratch/arguments"
 exec {arguments_fd}< "$scratch/arguments"
 for grant in 'org.freedesktop.Flatpak=talk' 'org.freedesktop.Flatpak.*=talk' 'org.freedesktop.systemd1.*=own' '*=talk'; do
 	printf '[Application]\nname=org.telegram.desktop\n[Session Bus Policy]\n%s\n' "$grant" > "$scratch/app-info"
 	if tg_bwrap_inspect --args "$arguments_fd" 2>/dev/null; then exit 1; fi
 done
 printf '[Application]\nname=org.telegram.desktop\n[Session Bus Policy]\norg.freedesktop.Notifications=talk\n' > "$scratch/app-info"
-tg_bwrap_inspect --args "$arguments_fd"
-[[ $TG_BWRAP_APP == yes ]]
+# A marked Telegram sandbox needs two explicit native yes/no values. Partial,
+# missing, ask and malformed metadata cannot silently grant either device.
+for microphone in yes no; do
+	for camera in yes no; do
+		printf '%s\0' --setenv TELEGRAM_WRAPPER telegram-sandbox \
+			--setenv TELEGRAM_MICROPHONE_CONSENT "$microphone" --setenv TELEGRAM_CAMERA_CONSENT "$camera" \
+			--ro-bind-data "$metadata_fd" /.flatpak-info > "$scratch/arguments"
+		tg_bwrap_inspect --args "$arguments_fd"
+		[[ $TG_BWRAP_APP == yes && $TG_BWRAP_MICROPHONE_CONSENT == "$microphone" && $TG_BWRAP_CAMERA_CONSENT == "$camera" ]]
+	done
+done
+for missing in both microphone camera; do
+	arguments=(--setenv TELEGRAM_WRAPPER telegram-sandbox --ro-bind-data "$metadata_fd" /.flatpak-info)
+	[[ $missing == both || $missing == microphone ]] || arguments+=(--setenv TELEGRAM_MICROPHONE_CONSENT yes)
+	[[ $missing == both || $missing == camera ]] || arguments+=(--setenv TELEGRAM_CAMERA_CONSENT yes)
+	printf '%s\0' "${arguments[@]}" > "$scratch/arguments"
+	if tg_bwrap_inspect --args "$arguments_fd" 2> "$scratch/consent-error"; then exit 1; fi
+	grep -q 'consent is missing or invalid' "$scratch/consent-error"
+done
+for device in MICROPHONE CAMERA; do
+	for invalid in '' ask true YES 'yes no'; do
+		printf '%s\0' --setenv TELEGRAM_WRAPPER telegram-sandbox \
+			--setenv TELEGRAM_MICROPHONE_CONSENT yes --setenv TELEGRAM_CAMERA_CONSENT yes \
+			--setenv "TELEGRAM_${device}_CONSENT" "$invalid" \
+			--ro-bind-data "$metadata_fd" /.flatpak-info > "$scratch/arguments"
+		if tg_bwrap_inspect --args "$arguments_fd" 2> "$scratch/consent-error"; then exit 1; fi
+		grep -q 'consent is missing or invalid' "$scratch/consent-error"
+	done
+done
 exec {metadata_fd}<&-
 exec {arguments_fd}<&-
 printf 'Telegram config, repeat setup choices and cleanup checks passed.\n'

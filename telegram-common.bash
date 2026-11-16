@@ -140,6 +140,14 @@ tg_config_save() (
 	chmod 600 -- "$temporary" && mv -fT -- "$temporary" "$TG_CONFIG_FILE"
 )
 
+# shellcheck disable=SC2034 # Effective native consent is shared with the launcher/probe.
+tg_consent_snapshot() {
+	TG_NATIVE_CONSENT=$(bash "$TG_PROGRAMS/telegram-consent.bash" snapshot) || return 1
+	[[ $TG_NATIVE_CONSENT =~ ^(yes|no)\ (yes|no)$ ]] || {
+		tg_error 'Invalid native microphone/camera consent snapshot.'; return 1;
+	}
+}
+
 # shellcheck disable=SC2034 # Both arrays are the public result used by the launcher.
 tg_policy_args() {
 	TG_FLATPAK_ARGS=(
@@ -149,6 +157,9 @@ tg_policy_args() {
 		--nosocket=ssh-auth --nosocket=gpg-agent --nosocket=pcsc --nosocket=cups
 		--nodevice=all --nodevice=usb --nodevice=input --nodevice=kvm --nodevice=shm --device=dri --nousb=all
 		--disallow=devel --disallow=bluetooth --disallow=canbus
+		--no-talk-name=org.freedesktop.Flatpak --no-talk-name=org.freedesktop.systemd1
+		--no-talk-name=org.freedesktop.portal.Flatpak --no-talk-name=org.freedesktop.impl.portal.PermissionStore
+		--no-talk-name=ca.desrt.dconf --system-no-talk-name=org.bluez
 		'--env=QT_QPA_PLATFORM=wayland;xcb' --unset-env=QT_PLUGIN_PATH
 	)
 	TG_PROFILE_ARGS=()
@@ -188,13 +199,14 @@ tg_origin_check() {
 
 tg_dependencies() {
 	local package state desktop=${XDG_CURRENT_DESKTOP:-}
-	local -a packages=(flatpak bubblewrap xdg-desktop-portal pulseaudio-utils util-linux xdg-utils desktop-file-utils procps) missing=()
+	local -a packages=(flatpak bubblewrap xdg-dbus-proxy xdg-desktop-portal pulseaudio-utils util-linux
+		pipewire-bin libpipewire-0.3-modules wireplumber libglib2.0-bin dconf-gsettings-backend
+		dconf-service systemd xdg-utils desktop-file-utils procps) missing=()
 	case :${desktop^^}: in
 		*:GNOME:*) packages+=(xdg-desktop-portal-gnome) ;;
 		*:KDE:*) packages+=(xdg-desktop-portal-kde) ;;
 		*) packages+=(xdg-desktop-portal-gtk) ;;
 	esac
-	if [[ $TG_MICROPHONE_MODE == none ]] && ! command -v pulseaudio >/dev/null; then packages+=(pipewire-bin libpipewire-0.3-modules); fi
 	for package in "${packages[@]}"; do
 		state=$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null) || state=
 		[[ $state == 'install ok installed' ]] || missing+=("$package")
@@ -239,7 +251,8 @@ tg_remove_files() {
 	local file
 	# These are this wrapper's files, never Telegram profiles or downloads.
 	tg_desktop_remove || return 1
-	for file in telegram-run.bash telegram-bwrap.bash telegram-common.bash telegram-media.bash telegram-audio.bash config-path; do
+	for file in telegram-run.bash telegram-bwrap.bash telegram-common.bash telegram-media.bash telegram-audio.bash \
+		telegram-consent.bash telegram-dbus-proxy.bash telegram-audio-broker.bash telegram-microphones.bash config-path; do
 		[[ ! -f $TG_INSTALL_DIR/$file && ! -L $TG_INSTALL_DIR/$file ]] || rm -- "$TG_INSTALL_DIR/$file" || return 1
 	done
 	if tg_audio_runtime_owned "$TG_INSTALL_DIR/pulseaudio"; then
@@ -252,7 +265,6 @@ tg_remove_files() {
 tg_remove() {
 	if command -v flatpak >/dev/null; then
 		tg_stop || return 1
-		flatpak permission-remove devices camera "$TG_APP" 2>/dev/null || :
 	fi
 	tg_remove_files || return 1
 	printf 'Telegram wrapper removed.\n'

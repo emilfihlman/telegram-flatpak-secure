@@ -13,10 +13,14 @@ main() {
 		return 1
 	}
 	tg_policy_args
+	tg_consent_snapshot
 	export FLATPAK_BWRAP="$TG_PROGRAMS/telegram-bwrap.bash"
-	unset FLATPAK_DBUSPROXY
-	TG_FLATPAK_ARGS+=(--env=TELEGRAM_WRAPPER=telegram-sandbox)
-	exec /usr/bin/flatpak run --user --branch=stable "${TG_FLATPAK_ARGS[@]}" \
+	export FLATPAK_DBUSPROXY="$TG_PROGRAMS/telegram-dbus-proxy.bash"
+	TG_FLATPAK_ARGS+=(--env=TELEGRAM_WRAPPER=telegram-sandbox
+		"--env=TELEGRAM_MICROPHONE_CONSENT=${TG_NATIVE_CONSENT%% *}"
+		"--env=TELEGRAM_CAMERA_CONSENT=${TG_NATIVE_CONSENT#* }")
+	exec "$TG_PROGRAMS/telegram-consent.bash" --run "$TG_NATIVE_CONSENT" -- \
+		/usr/bin/flatpak run --user --branch=stable --die-with-parent "${TG_FLATPAK_ARGS[@]}" \
 		--file-forwarding "$TG_APP" "${TG_PROFILE_ARGS[@]}" "$@"
 }
 

@@ -13,7 +13,8 @@ TG_CONFIG=$scratch/config/telegram-sandbox
 TG_CONFIG_FILE=$TG_CONFIG/settings
 TG_RUNTIME=$scratch/runtime
 mkdir -p -- "$TG_INSTALL_DIR" "$TG_RUNTIME"
-for file in telegram-run.bash telegram-common.bash telegram-media.bash telegram-audio.bash telegram-bwrap.bash; do
+for file in telegram-run.bash telegram-common.bash telegram-media.bash telegram-audio.bash telegram-bwrap.bash \
+	telegram-consent.bash telegram-dbus-proxy.bash telegram-audio-broker.bash telegram-microphones.bash; do
 	install -m 755 -- "$file" "$TG_INSTALL_DIR/$file"
 done
 printf '%s\0' "$TG_CONFIG_FILE" > "$TG_INSTALL_DIR/config-path"
@@ -24,6 +25,18 @@ printf 'devices\tcamera\t%s\tno\t0x00\n' "$TG_APP" > "$scratch/portal"
 : > "$scratch/user-global"
 : > "$scratch/system-app"
 : > "$scratch/system-global"
+# Exercise the real native consent parser with a private fixture store.
+mkdir -- "$scratch/bin"
+cat > "$scratch/bin/flatpak" <<'NATIVE_FLATPAK'
+#!/usr/bin/env bash
+[[ $* == 'permission-show org.telegram.desktop' ]] || exit 90
+cat -- "$TG_TEST_NATIVE_ROWS"
+NATIVE_FLATPAK
+printf '#!/usr/bin/env bash\nexit 0\n' > "$scratch/bin/gsettings"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$scratch/bin/busctl"
+chmod 755 -- "$scratch/bin/flatpak" "$scratch/bin/gsettings" "$scratch/bin/busctl"
+export TG_TEST_NATIVE_ROWS=$scratch/portal
+export PATH=$scratch/bin:$PATH
 flatpak() {
 	case $* in
 		'permission-show org.telegram.desktop') cat "$scratch/portal" ;;
@@ -71,7 +84,7 @@ if grep -q 'checks passed' "$scratch/result"; then exit 1; fi
 printf '[Session Bus Policy]\norg.freedesktop.Notifications=talk\n' > "$scratch/overrides"
 tg_check_repair_user_overrides < /dev/null
 [[ ! -e $scratch/resets ]]
-for grant in 'org.freedesktop.Flatpak=talk' 'org.freedesktop.Flatpak.*=talk' 'org.freedesktop.*=own' '*=talk'; do
+for grant in 'org.freedesktop.Flatpak=talk' 'org.freedesktop.Flatpak.*=talk' 'org.freedesktop.*=own' '*=talk' 'ca.desrt.dconf=talk' 'org.freedesktop.impl.portal.PermissionStore=talk' 'org.freedesktop.portal.*=talk'; do
 	printf '[Session Bus Policy]\n%s\n' "$grant" > "$scratch/overrides"
 	if tg_check_repair_user_overrides > "$scratch/repair" <<< no; then exit 1; fi
 	[[ ! -e $scratch/resets ]]
@@ -81,23 +94,26 @@ for grant in 'org.freedesktop.Flatpak=talk' 'org.freedesktop.Flatpak.*=talk' 'or
 	rm -- "$scratch/resets"
 done
 
-# The portal is an independent all-camera path: raw device checks are not enough.
-for TG_CAMERA_MODE in none selected; do
-	printf 'devices\tcamera\t%s\tno\t0x00\n' "$TG_APP" > "$scratch/portal"
-	tg_check_camera_portal > /dev/null
-	printf 'devices\tcamera\t%s\tyes\t0x00\n' "$TG_APP" > "$scratch/portal"
-	if tg_check_camera_portal > "$scratch/portal-result"; then exit 1; fi
-	grep -q 'requires no' "$scratch/portal-result"
+# Native consent remains authoritative for every configured scope. Missing and
+# ask values deny; malformed stores fail instead of granting access.
+for TG_CAMERA_MODE in none selected all; do
+	for permission in no yes ask; do
+		printf 'devices\tcamera\t%s\t%s\t0x00\ndevices\tmicrophone\t%s\t%s\t0x00\n' "$TG_APP" "$permission" "$TG_APP" "$permission" > "$scratch/portal"
+		tg_check_native_consent > "$scratch/portal-result"
+		if [[ $permission == yes ]]; then
+			grep -q 'microphone consent: yes; camera consent: yes' "$scratch/portal-result"
+		else
+			grep -q 'microphone consent: no; camera consent: no' "$scratch/portal-result"
+		fi
+	done
 	: > "$scratch/portal"
-	if tg_check_camera_portal > /dev/null; then exit 1; fi
+	tg_check_native_consent > "$scratch/portal-result"
+	grep -q 'microphone consent: no; camera consent: no' "$scratch/portal-result"
 done
-TG_CAMERA_MODE=all
-printf 'devices\tcamera\t%s\tyes\t0x00\n' "$TG_APP" > "$scratch/portal"
-tg_check_camera_portal > /dev/null
-printf 'devices\tcamera\t%s\tno\t0x00\n' "$TG_APP" > "$scratch/portal"
-if tg_check_camera_portal > /dev/null; then exit 1; fi
 printf 'devices\tcamera\t%s\tyes\t0x00\ndevices\tcamera\t%s\tyes\t0x00\n' "$TG_APP" "$TG_APP" > "$scratch/portal"
-if tg_check_camera_portal > /dev/null; then exit 1; fi
+if tg_check_native_consent > /dev/null 2>&1; then exit 1; fi
+printf 'malformed permission row\n' > "$scratch/portal"
+if tg_check_native_consent > /dev/null 2>&1; then exit 1; fi
 
 # Diagnostics identify inherited grants without clearing broad permission scopes.
 : > "$scratch/overrides"

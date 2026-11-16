@@ -50,58 +50,18 @@ tg_native_profile_available() {
 	done < <(pgrep -u "$UID" -x Telegram || :)
 }
 
-tg_setup_audio_runtime() {
-	# Keep the desktop's PipeWire packages and services. Only selected-input
-	# mode needs this private native broker when PulseAudio is not installed.
-	[[ $TG_MICROPHONE_MODE == selected ]] || return 0
-	! command -v pulseaudio >/dev/null || return 0
-	local version dependency runtime=$TG_SETUP_WORK/programs/pulseaudio unpack=$TG_SETUP_WORK/audio-package
-	local -a packages modules libraries
-	tg_packages_update || return 1
-	version=$(LC_ALL=C apt-cache policy pulseaudio | awk '/Candidate:/ { print $2; exit }') || return 1
-	[[ -n $version && $version != '(none)' ]] || { tg_error 'No native PulseAudio broker package is available.'; return 1; }
-	if tg_audio_runtime_owned "$TG_INSTALL_DIR/pulseaudio" && [[ -f $TG_INSTALL_DIR/pulseaudio/version && -f $TG_INSTALL_DIR/pulseaudio/dependencies && -x $TG_INSTALL_DIR/pulseaudio/bin/pulseaudio &&
-		$(cat "$TG_INSTALL_DIR/pulseaudio/version") == "$version" ]]; then
-		dependency=$(cat "$TG_INSTALL_DIR/pulseaudio/dependencies") || return 1
-		sudo apt-get satisfy --no-remove --no-install-recommends -y "$dependency" || return 1
-		cp -a --reflink=auto -- "$TG_INSTALL_DIR/pulseaudio" "$runtime" || return 1
-		if (source "$TG_SETUP_WORK/programs/telegram-audio.bash"; tg_audio_supported); then return 0; fi
-		# A broken disposable runtime must not be reused on every repair attempt.
-		rm -rf -- "$runtime" || return 1
-	fi
-	printf '\nPreparing the private microphone broker...\n'
-	(cd -- "$TG_SETUP_WORK" && apt-get download "pulseaudio=$version") || return 1
-	packages=("$TG_SETUP_WORK"/pulseaudio_*.deb)
-	[[ ${#packages[@]} == 1 && -f ${packages[0]} ]] || return 1
-	dependency=$(dpkg-deb -f "${packages[0]}" Depends) || return 1
-	sudo apt-get satisfy --no-remove --no-install-recommends -y "$dependency" || return 1
-	dpkg-deb -x "${packages[0]}" "$unpack" || return 1
-	modules=("$unpack"/usr/lib/pulse-*/modules)
-	libraries=("$unpack"/usr/lib/*/pulseaudio/libpulsecore-*.so)
-	[[ ${#modules[@]} == 1 && -d ${modules[0]} && ${#libraries[@]} == 1 && -f ${libraries[0]} ]] || return 1
-	mkdir -p -- "$runtime/bin" "$runtime/lib" || return 1
-	install -m 755 -- "$unpack/usr/bin/pulseaudio" "$runtime/bin/pulseaudio" || return 1
-	cp -a -- "${modules[0]}" "$runtime/modules" || return 1
-	install -m 644 -- "${libraries[0]}" "$runtime/lib/" || return 1
-	printf '%s\n' "$version" > "$runtime/version" || return 1
-	printf '%s\n' "$dependency" > "$runtime/dependencies" || return 1
-	printf 'telegram-flatpak-secure\n' > "$runtime/owner" || return 1
-	# Keep only the runtime used by the launcher, not package/config/service files.
-	rm -rf -- "$unpack" "${packages[0]}"
-}
-
 tg_setup_stage() {
 	local file
 	mkdir -p -- "$TG_DATA"
 	TG_SETUP_WORK=$(mktemp -d "$TG_DATA/.telegram-setup.XXXXXX")
 	printf 'telegram-setup\n' > "$TG_SETUP_WORK/owner"
 	mkdir -- "$TG_SETUP_WORK/programs"
-	for file in telegram-common.bash telegram-media.bash telegram-audio.bash telegram-bwrap.bash telegram-run.bash; do
+	for file in telegram-common.bash telegram-media.bash telegram-audio.bash telegram-bwrap.bash telegram-run.bash \
+		telegram-consent.bash telegram-dbus-proxy.bash telegram-audio-broker.bash telegram-microphones.bash; do
 		[[ -r $source_dir/$file ]] || { tg_error "Missing $file."; return 1; }
 		bash -n "$source_dir/$file" || return 1
 		install -m 755 -- "$source_dir/$file" "$TG_SETUP_WORK/programs/$file" || return 1
 	done
-	tg_setup_audio_runtime || return 1
 	(
 		TG_CONFIG=$TG_SETUP_WORK/config/telegram-sandbox
 		TG_CONFIG_FILE=$TG_CONFIG/settings
@@ -116,7 +76,8 @@ tg_setup_stage() {
 			case ${file##*/} in
 				pulseaudio)
 					tg_audio_runtime_owned "$file" || { tg_error "Unexpected wrapper runtime: $file"; return 1; } ;;
-				telegram-common.bash|telegram-media.bash|telegram-audio.bash|telegram-bwrap.bash|telegram-run.bash|config-path)
+				telegram-common.bash|telegram-media.bash|telegram-audio.bash|telegram-bwrap.bash|telegram-run.bash|\
+				telegram-consent.bash|telegram-dbus-proxy.bash|telegram-audio-broker.bash|telegram-microphones.bash|config-path)
 					[[ -f $file && ! -L $file ]] || { tg_error "Unexpected wrapper file: $file"; return 1; } ;;
 				*) tg_error "Unrelated file in wrapper directory: $file"; return 1 ;;
 			esac
@@ -126,7 +87,6 @@ tg_setup_stage() {
 }
 
 tg_setup_commit() {
-	local permission=no
 	printf '%s\0' "$TG_CONFIG_FILE" > "$TG_SETUP_WORK/programs/config-path" || return 1
 	[[ ! -d $TG_CONFIG_FILE ]] || return 1
 	mkdir -p -- "$TG_CONFIG" || return 1
@@ -136,9 +96,6 @@ tg_setup_commit() {
 	TG_SETUP_PROGRAM_ID=$(stat -Lc '%d:%i' -- "$TG_SETUP_WORK/programs") || return 1
 	TG_SETUP_REPLACING=no
 	[[ ! -d $TG_INSTALL_DIR ]] || TG_SETUP_REPLACING=yes
-	[[ $TG_CAMERA_MODE != all ]] || permission=yes
-	TG_SETUP_PERMISSION_CHANGED=yes
-	flatpak permission-set devices camera "$TG_APP" "$permission" || return 1
 	# Both directories share a filesystem. Exchange keeps the working copy intact
 	# until all replacement files are ready; the staging directory is then removed.
 	TG_SETUP_PENDING=yes
@@ -149,7 +106,6 @@ tg_setup_commit() {
 		mv --no-copy -T -- "$TG_SETUP_WORK/programs" "$TG_INSTALL_DIR" || return 1
 	fi
 	mv --no-copy -fT -- "$TG_SETUP_SETTINGS_TEMP" "$TG_CONFIG_FILE" || return 1
-	TG_SETUP_PERMISSION_CHANGED=no
 	TG_SETUP_PENDING=no
 	rm -- "$TG_SETUP_WORK/recovery-needed"
 	tg_desktop_apply "$TG_SETUP_WORK" || {
@@ -159,12 +115,12 @@ tg_setup_commit() {
 }
 
 tg_setup_cleanup() {
-	local status=$? permission=no
+	local status=$?
 	# Inode identity establishes which atomic rename completed, even if a signal
 	# arrived between a rename and the following shell assignment.
 	if [[ ${TG_SETUP_PENDING:-no} == yes && $(stat -Lc '%d:%i' -- "$TG_INSTALL_DIR" 2>/dev/null) == "${TG_SETUP_PROGRAM_ID:-}" ]]; then
 		if [[ $(stat -Lc '%d:%i' -- "$TG_CONFIG_FILE" 2>/dev/null) == "${TG_SETUP_SETTINGS_ID:-}" ]]; then
-			TG_SETUP_PERMISSION_CHANGED=no
+			: # Settings committed; the installed replacement is complete.
 		elif [[ ${TG_SETUP_REPLACING:-no} == yes ]]; then
 			mv --exchange --no-copy -T -- "$TG_SETUP_WORK/programs" "$TG_INSTALL_DIR" || {
 				TG_SETUP_KEEP_WORK=yes
@@ -172,14 +128,6 @@ tg_setup_cleanup() {
 			}
 		else
 			rm -rf -- "$TG_INSTALL_DIR"
-		fi
-	fi
-	if [[ ${TG_SETUP_PERMISSION_CHANGED:-no} == yes ]]; then
-		if [[ -n ${TG_SETUP_PREVIOUS_CAMERA_MODE:-} ]]; then
-			[[ $TG_SETUP_PREVIOUS_CAMERA_MODE != all ]] || permission=yes
-			flatpak permission-set devices camera "$TG_APP" "$permission" 2>/dev/null || printf 'Could not restore the previous camera permission. Run setup and choose Check / repair.\n' >&2
-		else
-			flatpak permission-remove devices camera "$TG_APP" 2>/dev/null || :
 		fi
 	fi
 	[[ -z ${TG_SETUP_SETTINGS_TEMP:-} ]] || rm -f -- "$TG_SETUP_SETTINGS_TEMP"
@@ -220,10 +168,8 @@ main() {
 	tg_setup_clear_abandoned
 	TG_SETUP_WORK=
 	TG_SETUP_KEEP_WORK=no
-	TG_SETUP_PERMISSION_CHANGED=no
 	TG_SETUP_PENDING=no
 	TG_SETUP_SETTINGS_TEMP=
-	TG_SETUP_PREVIOUS_CAMERA_MODE=
 	trap 'tg_setup_cleanup' EXIT
 	trap 'exit 129' HUP
 	trap 'exit 130' INT
@@ -231,8 +177,6 @@ main() {
 	if ! tg_config_load new; then
 		tg_config_defaults
 		printf 'Saved wrapper settings are invalid. Configure them again or remove the wrapper.\n'
-	elif [[ -f $TG_CONFIG_FILE ]]; then
-		TG_SETUP_PREVIOUS_CAMERA_MODE=$TG_CAMERA_MODE
 	fi
 	local action=1 answer socket origin
 	printf 'Telegram setup\n'
@@ -257,7 +201,7 @@ main() {
 	tg_dependencies
 	tg_profile_choose
 	tg_media_choose
-	tg_dependencies
+	printf 'Native settings control microphone/camera consent. Camera selections limit raw device access; the Camera portal is app-wide.\n'
 	tg_native_profile_available
 	printf '\nChecking desktop access...\n'
 	socket=$(LC_ALL=C pactl info | sed -n 's/^Server String: //p')
@@ -280,6 +224,7 @@ main() {
 	flatpak install "${install_args[@]}" flathub "$TG_APP//stable"
 	tg_origin_check
 	flatpak make-current --user "$TG_APP" stable
+	bash "$source_dir/telegram-consent.bash" init
 	tg_setup_stage
 	printf '\nChecking the replacement sandbox...\n'
 	(TG_INSTALL_DIR=$TG_SETUP_WORK/programs; tg_check_probe) || {
@@ -293,6 +238,8 @@ main() {
 		return 1
 	fi
 	printf '\nTelegram is ready. Launch Telegram from the application menu.\n'
+	printf 'On GNOME: Settings -> Apps -> Telegram controls microphone/camera consent. Missing grants start disabled.\n'
+	printf 'Saved microphone selections and raw-camera selections narrow those routes. Relaunch after changing native consent.\n'
 	read -r -p 'Start Telegram now? [Y/n]: ' answer
 	if [[ ${answer,,} != n && ${answer,,} != no ]]; then
 		nohup setsid --wait "$TG_LAUNCHER" -- {setup_lock}>&- >> "$TG_RUNTIME/telegram-sandbox.log" 2>&1 < /dev/null &

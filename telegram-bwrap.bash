@@ -10,6 +10,8 @@ tg_bwrap_inspect() {
 	TG_BWRAP_PULSE_SOCKET=
 	TG_BWRAP_SYNC_INDEX=
 	TG_BWRAP_SYNC_FD=
+	TG_BWRAP_MICROPHONE_CONSENT=
+	TG_BWRAP_CAMERA_CONSENT=
 	TG_BWRAP_PACKED=()
 	case ${1:-} in
 		--args) descriptor=${2:-} ;;
@@ -27,6 +29,8 @@ tg_bwrap_inspect() {
 				(( index + 2 < ${#packed[@]} )) || return 1
 				case ${packed[index+1]} in
 					TELEGRAM_WRAPPER) [[ ${packed[index+2]} != telegram-sandbox ]] || marker=yes ;;
+					TELEGRAM_MICROPHONE_CONSENT) TG_BWRAP_MICROPHONE_CONSENT=${packed[index+2]} ;;
+					TELEGRAM_CAMERA_CONSENT) TG_BWRAP_CAMERA_CONSENT=${packed[index+2]} ;;
 				esac
 				index=$((index + 2)) ;;
 			--ro-bind-data)
@@ -64,6 +68,10 @@ tg_bwrap_inspect() {
 		fi
 	done < "/proc/self/fd/$metadata_fd"
 	[[ $application != org.telegram.desktop || $marker != yes ]] || TG_BWRAP_APP=yes
+	if [[ $TG_BWRAP_APP == yes && ! "$TG_BWRAP_MICROPHONE_CONSENT $TG_BWRAP_CAMERA_CONSENT" =~ ^(yes|no)\ (yes|no)$ ]]; then
+		printf 'Error: native microphone/camera consent is missing or invalid.\n' >&2
+		return 1
+	fi
 	if [[ $TG_BWRAP_APP == yes && $unsafe_bus == yes ]]; then
 		printf 'Error: inherited Telegram permissions allow host control through D-Bus. Remove that grant before launching.\n' >&2
 		return 1
@@ -72,44 +80,40 @@ tg_bwrap_inspect() {
 
 tg_bwrap_audio() {
 	local directory permissions suffix
-	if [[ $TG_MICROPHONE_MODE == all ]]; then
-		TG_BWRAP_PULSE_SOCKET=$TG_PULSE_SOCKET
-	else
-		# Each native sandbox gets its own broker. An update creates a new
-		# sandbox; an ordinary relaunch retains this sandbox's sync pipe.
-		coproc TG_BWRAP_AUDIO { tg_audio_sandbox "$TG_BWRAP_SYNC_FD"; }
-		TG_BWRAP_OWNER_PID=${TG_BWRAP_AUDIO_PID:-}
-		local notification_fd=${TG_BWRAP_AUDIO[0]} input_fd=${TG_BWRAP_AUDIO[1]}
-		# A shell dup retains a coprocess FD's close-on-exec bit. Reopen its
-		# pipe so the native bwrap process can inherit the lifetime writer.
-		exec {TG_BWRAP_AUDIO_FD}> "/proc/self/fd/$input_fd"
-		exec {input_fd}>&-
-		trap 'tg_bwrap_audio_abort' EXIT
-		trap 'exit 129' HUP
-		trap 'exit 130' INT
-		trap 'exit 143' TERM
-		if ! IFS= read -r -t 60 -u "$notification_fd" TG_BWRAP_PULSE_SOCKET; then
-			exec {notification_fd}<&-
-			return 1
-		fi
+	# Each native sandbox gets its own broker. An update creates a new
+	# sandbox; an ordinary relaunch retains this sandbox's sync pipe.
+	coproc TG_BWRAP_AUDIO { tg_audio_sandbox "$TG_BWRAP_SYNC_FD"; }
+	TG_BWRAP_OWNER_PID=${TG_BWRAP_AUDIO_PID:-}
+	local notification_fd=${TG_BWRAP_AUDIO[0]} input_fd=${TG_BWRAP_AUDIO[1]}
+	# A shell dup retains a coprocess FD's close-on-exec bit. Reopen its
+	# pipe so the native bwrap process can inherit the lifetime writer.
+	exec {TG_BWRAP_AUDIO_FD}> "/proc/self/fd/$input_fd"
+	exec {input_fd}>&-
+	trap 'tg_bwrap_audio_abort' EXIT
+	trap 'exit 129' HUP
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	if ! IFS= read -r -t 60 -u "$notification_fd" TG_BWRAP_PULSE_SOCKET; then
 		exec {notification_fd}<&-
-		if [[ -n $TG_BWRAP_SYNC_INDEX ]]; then
-			TG_BWRAP_PACKED[TG_BWRAP_SYNC_INDEX]=$TG_BWRAP_AUDIO_FD
-			exec {TG_BWRAP_SYNC_FD}>&-
-		else
-			TG_BWRAP_PACKED+=(--sync-fd "$TG_BWRAP_AUDIO_FD")
-		fi
-		# Keep native argument/metadata FDs intact, including large argument
-		# lists; only the one sync handle changes. Released bwrap accepts one.
-		exec {TG_BWRAP_ARGS_FD}<&-
-		exec {TG_BWRAP_REPLACEMENT_FD}< <(printf '%s\0' "${TG_BWRAP_PACKED[@]}")
-		directory=${TG_BWRAP_PULSE_SOCKET%/native}
-		suffix=${directory#"$TG_RUNTIME/telegram-audio."}
-		[[ $suffix =~ ^[A-Za-z0-9]{6}$ && $TG_BWRAP_PULSE_SOCKET == "$TG_RUNTIME/telegram-audio.$suffix/native" ]] || return 1
-		[[ -d $directory && ! -L $directory && -O $directory ]] || return 1
-		permissions=$(stat -Lc '%a' -- "$directory") || return 1
-		[[ $permissions == 700 ]] || return 1
+		return 1
 	fi
+	exec {notification_fd}<&-
+	if [[ -n $TG_BWRAP_SYNC_INDEX ]]; then
+		TG_BWRAP_PACKED[TG_BWRAP_SYNC_INDEX]=$TG_BWRAP_AUDIO_FD
+		exec {TG_BWRAP_SYNC_FD}>&-
+	else
+		TG_BWRAP_PACKED+=(--sync-fd "$TG_BWRAP_AUDIO_FD")
+	fi
+	# Keep native argument/metadata FDs intact, including large argument
+	# lists; only the one sync handle changes. Released bwrap accepts one.
+	exec {TG_BWRAP_ARGS_FD}<&-
+	exec {TG_BWRAP_REPLACEMENT_FD}< <(printf '%s\0' "${TG_BWRAP_PACKED[@]}")
+	directory=${TG_BWRAP_PULSE_SOCKET%/pulse/native}
+	suffix=${directory#"$TG_RUNTIME/telegram-audio/instance."}
+	[[ $suffix =~ ^[A-Za-z0-9]{6}$ && $TG_BWRAP_PULSE_SOCKET == "$TG_RUNTIME/telegram-audio/instance.$suffix/pulse/native" ]] || return 1
+	[[ -d $directory && ! -L $directory && -O $directory ]] || return 1
+	permissions=$(stat -Lc '%a' -- "$directory") || return 1
+	[[ $permissions == 700 ]] || return 1
 	[[ -S $TG_BWRAP_PULSE_SOCKET && ! -L $TG_BWRAP_PULSE_SOCKET && -O $TG_BWRAP_PULSE_SOCKET ]] || return 1
 	TG_BWRAP_MEDIA+=(--ro-bind "$TG_BWRAP_PULSE_SOCKET" /run/flatpak/pulse/native
 		--setenv PULSE_SERVER unix:/run/flatpak/pulse/native --unsetenv PULSE_CLIENTCONFIG
@@ -135,6 +139,12 @@ main() {
 	source "$sibling/telegram-common.bash"
 	tg_paths
 	tg_config_load required
+	TG_NATIVE_CONSENT="$TG_BWRAP_MICROPHONE_CONSENT $TG_BWRAP_CAMERA_CONSENT"
+	[[ $TG_BWRAP_CAMERA_CONSENT == yes ]] || TG_CAMERA_MODE=none
+	if [[ $TG_BWRAP_MICROPHONE_CONSENT != yes ]]; then
+		TG_MICROPHONE_MODE=none
+		TG_MICROPHONE_IDS=()
+	fi
 	source "$sibling/telegram-media.bash"
 	source "$sibling/telegram-audio.bash"
 	TG_BWRAP_MEDIA=()

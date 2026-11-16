@@ -7,18 +7,19 @@ tg_check_probe() (
 	# shellcheck source=telegram-common.bash
 	source "$TG_INSTALL_DIR/telegram-common.bash"
 	tg_paths && tg_config_load required && tg_policy_args || return 1
+	tg_consent_snapshot || return 1
 	export FLATPAK_BWRAP="$TG_PROGRAMS/telegram-bwrap.bash"
-	unset FLATPAK_DBUSPROXY
-	TG_FLATPAK_ARGS+=(--env=TELEGRAM_WRAPPER=telegram-sandbox)
+	export FLATPAK_DBUSPROXY="$TG_PROGRAMS/telegram-dbus-proxy.bash"
+	TG_FLATPAK_ARGS+=(--env=TELEGRAM_WRAPPER=telegram-sandbox
+		"--env=TELEGRAM_MICROPHONE_CONSENT=${TG_NATIVE_CONSENT%% *}"
+		"--env=TELEGRAM_CAMERA_CONSENT=${TG_NATIVE_CONSENT#* }")
 	host_socket=$TG_PULSE_SOCKET
 	settings_id=$(stat -Lc '%d:%i' -- "$TG_CONFIG_FILE") || return 1
 	wayland_socket=$(tg_wayland_socket) || return 1
 	# Flatpak may supply a per-app Wayland proxy, so socket identity can differ.
 	[[ ! -S $wayland_socket ]] || wayland_available=yes
-	socket_id=
-	if [[ $TG_MICROPHONE_MODE == all ]]; then
-		socket_id=$(stat -Lc '%d:%i' -- "$TG_PULSE_SOCKET") || return 1
-	fi
+	socket_id=$(stat -Lc '%d:%i' -- "$TG_PULSE_SOCKET") || return 1
+	[[ ${TG_NATIVE_CONSENT#* } == yes ]] || TG_CAMERA_MODE=none
 	tg_media_resolve || return 1
 	probe=$(cat <<'PROBE'
 set -eu
@@ -33,10 +34,10 @@ shift 5
 [ "${QT_QPA_PLATFORM:-}" = 'wayland;xcb' ] || fail 'Unexpected Qt display selection.'
 [ "${PULSE_SERVER:-}" = unix:/run/flatpak/pulse/native ] || fail 'Unexpected audio endpoint.'
 [ -S /run/flatpak/pulse/native ] || fail 'Approved audio socket is missing.'
-# The hook starts restricted audio for this sandbox and supplies the
-# approved socket's host identity. Direct microphone access has a saved endpoint.
-[ -n "$socket_id" ] || socket_id=${TELEGRAM_AUDIO_SOCKET_ID:-}
-[ "$(stat -Lc '%d:%i' /run/flatpak/pulse/native)" = "$socket_id" ] || fail 'Audio socket does not match the approved endpoint.'
+# Every microphone mode uses a private broker. The host server is never mounted.
+actual_socket_id=$(stat -Lc '%d:%i' /run/flatpak/pulse/native)
+[ "$actual_socket_id" = "${TELEGRAM_AUDIO_SOCKET_ID:-}" ] || fail 'Audio socket does not match the approved endpoint.'
+[ "$actual_socket_id" != "$socket_id" ] || fail 'Desktop audio socket bypasses native consent.'
 if [ -e "$settings" ]; then
 	[ "$(stat -Lc '%d:%i' -- "$settings")" != "$settings_id" ] || fail 'Wrapper settings are exposed inside the sandbox.'
 fi
@@ -113,13 +114,14 @@ printf 'OK      Native %s sandbox/media probe: selected cameras, approved audio,
 PROBE
 	)
 	# A stuck diagnostic must not leave its sandbox or private broker running.
-	timeout --kill-after=5s 60s /usr/bin/flatpak run --user --branch=stable --die-with-parent "${TG_FLATPAK_ARGS[@]}" \
+	timeout --kill-after=5s 60s bash "$TG_PROGRAMS/telegram-consent.bash" --run "$TG_NATIVE_CONSENT" -- \
+		/usr/bin/flatpak run --user --branch=stable --die-with-parent "${TG_FLATPAK_ARGS[@]}" \
 		--command=sh "$TG_APP" -c "$probe" telegram-check \
 		"$TG_CONFIG_FILE" "$host_socket" "$socket_id" "$settings_id" "$wayland_available" "${TG_CAMERA_NODES[@]}"
 )
 
 tg_check_unsafe_grants() {
-	local section='' line name namespace grant
+	local section='' line name namespace grant forbidden
 	TG_CHECK_UNSAFE=()
 	while IFS= read -r line || [[ -n $line ]]; do
 		case $line in
@@ -131,11 +133,14 @@ tg_check_unsafe_grants() {
 				[[ $grant == talk || $grant == own ]] || continue
 				namespace=
 				[[ $name != *'.*' ]] || namespace=${name%'.*'}
-				# shellcheck disable=SC2053 # Compare native D-Bus namespace patterns.
-				if [[ org.freedesktop.Flatpak == $name || org.freedesktop.systemd1 == $name ||
-					org.freedesktop.Flatpak == "$namespace" || org.freedesktop.systemd1 == "$namespace" ]]; then
-					TG_CHECK_UNSAFE+=("$line")
-				fi ;;
+				for forbidden in org.freedesktop.Flatpak org.freedesktop.systemd1 org.freedesktop.portal.Flatpak \
+					org.freedesktop.impl.portal.PermissionStore ca.desrt.dconf; do
+					# shellcheck disable=SC2053 # Compare native D-Bus namespace patterns.
+					if [[ $forbidden == $name || $forbidden == "$namespace" ]]; then
+						TG_CHECK_UNSAFE+=("$line")
+						break
+					fi
+				done ;;
 		esac
 	done
 }
@@ -188,23 +193,13 @@ tg_check_diagnose_overrides() {
 	return 0
 }
 
-tg_check_camera_portal() {
-	local rows table object application permission _data expected=no count=0 actual='missing'
-	[[ $TG_CAMERA_MODE != all ]] || expected=yes
-	if ! rows=$(flatpak permission-show "$TG_APP"); then
-		printf 'CHECK   Could not read the camera portal permission.\n'
+tg_check_native_consent() {
+	local TG_PROGRAMS=$TG_INSTALL_DIR
+	if ! tg_consent_snapshot; then
+		printf 'CHECK   Native microphone/camera consent cannot be verified.\n'
 		return 1
 	fi
-	while IFS=$'\t' read -r table object application permission _data; do
-		[[ $table == devices && $object == camera && $application == "$TG_APP" ]] || continue
-		count=$((count + 1))
-		actual=$permission
-	done <<< "$rows"
-	if (( count != 1 )) || [[ $actual != "$expected" ]]; then
-		printf 'CHECK   Camera portal permission is %s; camera mode %s requires %s. Update/configure repairs it.\n' "$actual" "$TG_CAMERA_MODE" "$expected"
-		return 1
-	fi
-	printf 'OK      Camera portal permission matches camera mode %s.\n' "$TG_CAMERA_MODE"
+	printf 'OK      Native microphone consent: %s; camera consent: %s.\n' "${TG_NATIVE_CONSENT%% *}" "${TG_NATIVE_CONSENT#* }"
 }
 
 tg_check() (
@@ -217,7 +212,8 @@ tg_check() (
 		failed=1
 		ready=no
 	fi
-	for file in telegram-run.bash telegram-common.bash telegram-media.bash telegram-audio.bash telegram-bwrap.bash; do
+	for file in telegram-run.bash telegram-common.bash telegram-media.bash telegram-audio.bash telegram-bwrap.bash \
+		telegram-consent.bash telegram-dbus-proxy.bash telegram-audio-broker.bash telegram-microphones.bash; do
 		if [[ ! -x $TG_INSTALL_DIR/$file ]]; then
 			printf 'CHECK   Missing installed helper: %s\n' "$file"
 			failed=1
@@ -237,7 +233,7 @@ tg_check() (
 		failed=1
 	fi
 	if [[ $ready == yes ]]; then
-		if ! tg_check_camera_portal; then failed=1; fi
+		if ! tg_check_native_consent; then failed=1; fi
 		if ! tg_check_probe; then
 			printf 'CHECK   Native sandbox/media probe failed.\n'
 			failed=1

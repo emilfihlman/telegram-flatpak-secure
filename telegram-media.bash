@@ -81,8 +81,8 @@ tg_microphones_discover() {
 
 tg_microphones_show() {
 	local index mark state
-	printf '\nMicrophone access: %s\n' "$TG_MICROPHONE_MODE"
-	[[ $TG_MICROPHONE_MODE != all ]] || printf 'All microphones are allowed.\n'
+	printf '\nMicrophone selection: %s (native consent is also required)\n' "$TG_MICROPHONE_MODE"
+	[[ $TG_MICROPHONE_MODE != all ]] || printf 'All microphone inputs are selected.\n'
 	if (( ${#TG_MICROPHONES_IDS[@]} == 0 )); then
 		printf 'No configured or connected microphones.\n'
 	fi
@@ -220,8 +220,8 @@ tg_media_discover() {
 
 tg_media_show() {
 	local index mark state
-	printf '\nCamera access: %s\n' "$TG_CAMERA_MODE"
-	[[ $TG_CAMERA_MODE != all ]] || printf 'All cameras are allowed.\n'
+	printf '\nDirect camera device selection: %s (native consent is also required)\n' "$TG_CAMERA_MODE"
+	[[ $TG_CAMERA_MODE != all ]] || printf 'All direct camera devices are selected.\n'
 	if (( ${#TG_MEDIA_IDS[@]} == 0 )); then
 		printf 'No configured cameras or connected cameras with persistent identities.\n'
 	fi
@@ -240,7 +240,7 @@ tg_media_choose() {
 	tg_media_discover || return 1
 	while true; do
 		tg_media_show
-		printf "Enter 'all', 'none', or the camera numbers to allow (space separated).\n"
+		printf "Enter 'all', 'none', or the camera numbers for direct device access (space separated).\n"
 		read -r -p 'Camera choice (Enter keeps current): ' answer || return 1
 		answer=${answer#"${answer%%[![:space:]]*}"}
 		answer=${answer%"${answer##*[![:space:]]}"}
@@ -279,7 +279,7 @@ tg_media_choose() {
 		break
 	done
 	tg_microphones_choose || return 1
-	printf 'Selected camera access: %s. Microphone access: %s. Audio playback remains available.\n' "$TG_CAMERA_MODE" "$TG_MICROPHONE_MODE"
+	printf 'Direct camera devices: %s. Microphone selection: %s. Native consent is required; audio playback remains available.\n' "$TG_CAMERA_MODE" "$TG_MICROPHONE_MODE"
 }
 
 tg_media_resolve() {

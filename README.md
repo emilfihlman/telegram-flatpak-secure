@@ -2,6 +2,27 @@
 
 Telegram Desktop from Flathub, with configurable camera and microphone access.
 
+## How it works
+
+```mermaid
+flowchart LR
+	installed["Existing Flatpak<br/>Telegram + runtime"]
+	wrapper["Launch overrides<br/>+ bubblewrap hook"]
+	cameras["Camera allowlist<br/>Selected / all / none"]
+	audio["Audio access<br/>Mic on / playback only"]
+	subgraph sandbox["Flatpak's bubblewrap sandbox"]
+		telegram["Telegram Desktop"]
+	end
+	installed --> wrapper
+	wrapper --> telegram
+	cameras -->|Approved devices| telegram
+	audio -->|Approved socket| telegram
+```
+
+The launcher customizes **Flatpak's own sandbox at each launch**, using permission overrides and a bubblewrap hook. It removes broad filesystem, device and host-service access, then adds the approved camera devices and audio socket. Linux namespaces and bind mounts control what Telegram can see and access. The configured profile, Telegram downloads, network, GPU and desktop display remain available; microphone blocking keeps sound playback available.
+
+Two `bwrap` processes can still appear in the process tree: [Bubblewrap can keep an outside monitor and an inside PID 1 supervisor](https://github.com/containers/bubblewrap/blob/main/bwrap.xml) for a single sandbox. They do not by themselves indicate an additional sandbox layer.
+
 ## Setup
 
 Open a terminal in your X11 or Wayland desktop session on Debian and run:

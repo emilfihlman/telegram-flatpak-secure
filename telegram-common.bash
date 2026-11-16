@@ -39,6 +39,19 @@ tg_config_defaults() {
 
 tg_plain_path() { [[ $1 == /* && $1 != *[$'\001'-$'\037'$'\177']* ]]; }
 
+tg_wayland_socket() {
+	local display=${WAYLAND_DISPLAY-wayland-0}
+	if [[ $display == /* ]]; then
+		printf '%s\n' "$display"
+	else
+		printf '%s/%s\n' "${XDG_RUNTIME_DIR:-/run/user/$UID}" "$display"
+	fi
+}
+
+tg_desktop_session() {
+	[[ -n ${DBUS_SESSION_BUS_ADDRESS:-} && ( -n ${DISPLAY:-} || -S $(tg_wayland_socket) ) ]]
+}
+
 tg_config_load() {
 	# shellcheck source=telegram-media.bash
 	source "$TG_PROGRAMS/telegram-media.bash"
@@ -93,12 +106,12 @@ tg_config_save() (
 tg_policy_args() {
 	TG_FLATPAK_ARGS=(
 		--nofilesystem=host:reset '--filesystem=xdg-download/Telegram Desktop:create'
-		--unshare=ipc --share=network --socket=wayland --nosocket=x11 --nosocket=fallback-x11
+		--unshare=ipc --share=network --socket=wayland --nosocket=x11 --socket=fallback-x11
 		--nosocket=pulseaudio --nosocket=session-bus --nosocket=system-bus
 		--nosocket=ssh-auth --nosocket=gpg-agent --nosocket=pcsc --nosocket=cups
 		--nodevice=all --nodevice=usb --nodevice=input --nodevice=kvm --nodevice=shm --device=dri --nousb=all
 		--disallow=devel --disallow=bluetooth --disallow=canbus
-		--env=QT_QPA_PLATFORM=wayland --unset-env=QT_PLUGIN_PATH
+		'--env=QT_QPA_PLATFORM=wayland;xcb' --unset-env=QT_PLUGIN_PATH
 	)
 	TG_PROFILE_ARGS=()
 	if [[ $TG_PROFILE == native ]]; then

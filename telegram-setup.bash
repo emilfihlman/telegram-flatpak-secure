@@ -207,8 +207,8 @@ main() {
 			*) return 0 ;;
 		esac
 	fi
-	[[ -n ${WAYLAND_DISPLAY:-} && -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] || {
-		tg_error 'Open a terminal in your Wayland desktop session.'; return 1;
+	tg_desktop_session || {
+		tg_error 'Open a terminal in your graphical desktop session.'; return 1;
 	}
 	TG_RUNTIME=$desktop_runtime
 	tg_profile_choose

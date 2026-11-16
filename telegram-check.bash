@@ -2,7 +2,7 @@
 # Sourced by setup; the live probe does not start or interrupt Telegram.
 
 tg_check_probe() (
-	local host_socket socket_id settings_id probe
+	local host_socket socket_id settings_id wayland_socket wayland_available=no probe
 	# Use the installed launcher's policy and hook, including its saved paths.
 	# shellcheck source=telegram-common.bash
 	source "$TG_INSTALL_DIR/telegram-common.bash"
@@ -12,6 +12,9 @@ tg_check_probe() (
 	TG_FLATPAK_ARGS+=(--env=TELEGRAM_WRAPPER=telegram-sandbox)
 	host_socket=$TG_PULSE_SOCKET
 	settings_id=$(stat -Lc '%d:%i' -- "$TG_CONFIG_FILE") || return 1
+	wayland_socket=$(tg_wayland_socket) || return 1
+	# Flatpak may supply a per-app Wayland proxy, so socket identity can differ.
+	[[ ! -S $wayland_socket ]] || wayland_available=yes
 	if [[ $TG_MICROPHONE == no ]]; then
 		# shellcheck source=telegram-audio.bash
 		source "$TG_PROGRAMS/telegram-audio.bash"
@@ -33,8 +36,10 @@ settings=$1
 host_socket=$2
 socket_id=$3
 settings_id=$4
-shift 4
+wayland_available=$5
+shift 5
 [ "${TELEGRAM_WRAPPER:-}" = telegram-sandbox ] || fail 'Wrapper marker is missing.'
+[ "${QT_QPA_PLATFORM:-}" = 'wayland;xcb' ] || fail 'Unexpected Qt display selection.'
 [ "${PULSE_SERVER:-}" = unix:/run/flatpak/pulse/native ] || fail 'Unexpected audio endpoint.'
 [ -S /run/flatpak/pulse/native ] || fail 'Approved audio socket is missing.'
 [ "$(stat -Lc '%d:%i' /run/flatpak/pulse/native)" = "$socket_id" ] || fail 'Audio socket does not match the approved endpoint.'
@@ -56,6 +61,38 @@ for node in /dev/video*; do
 	for selected do [ "$node" != "$selected" ] || allowed=yes; done
 	[ "$allowed" = yes ] || fail "Unselected camera is exposed: $node"
 done
+wayland_socket=${WAYLAND_DISPLAY-wayland-0}
+case $wayland_socket in
+	/*) ;;
+	*) wayland_socket=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$wayland_socket ;;
+esac
+if [ "$wayland_available" = yes ]; then
+	[ -S "$wayland_socket" ] || fail 'The available Wayland socket is missing.'
+	[ -z "${DISPLAY:-}" ] || fail 'X11 display access is enabled while Wayland is available.'
+	for path in /tmp/.X11-unix/X*; do
+		[ ! -S "$path" ] || fail 'An X11 socket is exposed while Wayland is available.'
+	done
+	display_backend=Wayland
+else
+	[ "$wayland_available" = no ] || fail 'Unexpected display availability check.'
+	[ ! -S "$wayland_socket" ] || fail 'An unexpected Wayland socket is exposed.'
+	[ -n "${DISPLAY:-}" ] || fail 'No usable display was passed to the sandbox.'
+	if [ -n "${XAUTHORITY:-}" ]; then
+		[ -r "$XAUTHORITY" ] || fail 'The X11 authorization file is unavailable.'
+	fi
+	display_number=
+	case $DISPLAY in
+		:*) display_number=${DISPLAY#:} ;;
+		unix:*) display_number=${DISPLAY#unix:} ;;
+		unix/:*) display_number=${DISPLAY#unix/:} ;;
+	esac
+	if [ -n "$display_number" ]; then
+		display_number=${display_number%%.*}
+		case $display_number in ''|*[!0-9]*) fail 'Unexpected local X11 display.' ;; esac
+		[ -S "/tmp/.X11-unix/X$display_number" ] || fail 'The selected X11 socket is unavailable.'
+	fi
+	display_backend=X11
+fi
 section=
 sockets=
 while IFS= read -r line || [ -n "$line" ]; do
@@ -64,7 +101,11 @@ while IFS= read -r line || [ -n "$line" ]; do
 		sockets=*)
 			[ "$section" = '[Context]' ] || continue
 			sockets=${line#sockets=}
-			[ "$sockets" = 'wayland;' ] || fail "Unexpected display/socket permissions: $sockets" ;;
+			# Native fallback metadata can retain x11 even when it is not mounted.
+			case $sockets in
+				'wayland;fallback-x11;'|'fallback-x11;wayland;'|'x11;wayland;fallback-x11;') ;;
+				*) fail "Unexpected display/socket permissions: $sockets" ;;
+			esac ;;
 		devices=*)
 			[ "$section" = '[Context]' ] || continue
 			case ${line#devices=} in ''|'dri;') ;; *) fail 'Broad device permissions are enabled.' ;; esac ;;
@@ -73,14 +114,14 @@ while IFS= read -r line || [ -n "$line" ]; do
 			case ${line#shared=} in ''|'network;') ;; *) fail 'Unexpected shared IPC permissions.' ;; esac ;;
 	esac
 done < /.flatpak-info
-[ "$sockets" = 'wayland;' ] || fail 'Wayland policy was not found.'
-printf 'OK      Native sandbox/media probe: selected cameras, approved audio, no raw audio devices.\n'
+[ -n "$sockets" ] || fail 'Display policy was not found.'
+printf 'OK      Native %s sandbox/media probe: selected cameras, approved audio, no raw audio devices.\n' "$display_backend"
 PROBE
 	)
 	# A stuck diagnostic must not leave its sandbox or private broker running.
 	timeout --kill-after=5s 60s /usr/bin/flatpak run --user --branch=stable --die-with-parent "${TG_FLATPAK_ARGS[@]}" \
 		--command=sh "$TG_APP" -c "$probe" telegram-check \
-		"$TG_CONFIG_FILE" "$host_socket" "$socket_id" "$settings_id" "${TG_CAMERA_NODES[@]}"
+		"$TG_CONFIG_FILE" "$host_socket" "$socket_id" "$settings_id" "$wayland_available" "${TG_CAMERA_NODES[@]}"
 )
 
 tg_check_unsafe_grants() {

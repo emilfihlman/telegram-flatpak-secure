@@ -8,8 +8,8 @@ main() {
 	source "$sibling/telegram-common.bash"
 	tg_paths
 	tg_config_load required || { tg_error 'Run ./telegram-setup.bash to configure Telegram.'; return 1; }
-	[[ -n ${WAYLAND_DISPLAY:-} && -n ${DBUS_SESSION_BUS_ADDRESS:-} ]] || {
-		printf 'Launch Telegram from your Wayland desktop session.\n' >&2
+	tg_desktop_session || {
+		printf 'Launch Telegram from your graphical desktop session.\n' >&2
 		return 1
 	}
 	tg_policy_args

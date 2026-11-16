@@ -35,7 +35,9 @@ Launch **Telegram** from the application menu afterward. Setup routes the menu e
 
 The same launcher uses Wayland when available and falls back to X11 automatically. X11 shares display access between applications; Wayland provides stronger display isolation.
 
-Run `./telegram-setup.bash` again to update Telegram, change camera/microphone access, choose an existing Telegram profile, check and repair the setup, or remove the wrapper. Repeated setup keeps the current choices unless you change them. Profiles and downloads are retained.
+Telegram can update through its own updater or your desktop's Flatpak update tools, including automatic updates when enabled. Rerunning setup is optional for Telegram updates.
+
+Run `./telegram-setup.bash` again to change camera/microphone access, choose an existing Telegram profile, check and repair the setup, or remove the wrapper. Repeated setup keeps the current choices unless you change them. Profiles and downloads are retained.
 
 Microphone blocking keeps sound playback available. Camera access can be limited to selected cameras or allowed for all cameras.
 

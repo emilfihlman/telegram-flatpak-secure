@@ -72,7 +72,7 @@ tg_bwrap_inspect() {
 
 tg_bwrap_audio() {
 	local directory permissions suffix
-	if [[ $TG_MICROPHONE == yes ]]; then
+	if [[ $TG_MICROPHONE_MODE == all ]]; then
 		TG_BWRAP_PULSE_SOCKET=$TG_PULSE_SOCKET
 	else
 		# Each native sandbox gets its own broker. An update creates a new

@@ -6,6 +6,139 @@ tg_media_valid_camera() {
 		[[ -n $2 && $2 != . && $2 != .. && $2 != */* && $2 != *$'\t'* && $2 != *$'\r'* && $2 != *$'\n'* && $2 =~ ^[[:print:]]+$ ]]
 }
 
+tg_media_valid_microphone() {
+	# Avoid numeric and monitor aliases interpreted specially by Pulse providers.
+	# These characters are also safe in native configuration syntax.
+	[[ $1 =~ ^[A-Za-z0-9_.:-]+$ && ! $1 =~ ^[0-9] && $1 != *.monitor && $1 != yes && $1 != no ]]
+}
+
+tg_microphone_sources() {
+	timeout --kill-after=1s 10s pactl "$@" list sources
+}
+
+tg_microphones_discover() {
+	local sources rows index identity label
+	local -a arguments=()
+	local -A groups=()
+	TG_MICROPHONES_IDS=()
+	TG_MICROPHONES_LABELS=()
+	TG_MICROPHONES_CONNECTED=()
+	TG_MICROPHONES_SELECTED=()
+	# Saved, disconnected microphones stay visible so they can be kept or removed.
+	for identity in "${TG_MICROPHONE_IDS[@]}"; do
+		tg_media_valid_microphone "$identity" || return 1
+		[[ ! ${groups[$identity]+present} ]] || return 1
+		groups[$identity]=${#TG_MICROPHONES_IDS[@]}
+		TG_MICROPHONES_IDS+=("$identity")
+		TG_MICROPHONES_LABELS+=("$identity")
+		TG_MICROPHONES_CONNECTED+=(no)
+		TG_MICROPHONES_SELECTED+=(yes)
+	done
+	[[ -z ${1:-} ]] || arguments+=("--server=unix:$1")
+	sources=$(LC_ALL=C tg_microphone_sources "${arguments[@]}") || {
+		printf 'Could not list microphones from the desktop audio server.\n' >&2
+		return 1
+	}
+	# Monitor names are arbitrary. Only the server's explicit non-monitor field
+	# establishes that a source is a recording input rather than playback audio.
+	rows=$(LC_ALL=C awk '
+		function emit() {
+			if (source && name != "" && monitor_seen && monitor == "n/a") {
+				gsub(/[\001-\037\177]/, "?", name)
+				gsub(/[\001-\037\177]/, "?", description)
+				printf "%s\t%s\n", name, description != "" ? description : name
+			}
+		}
+		/^Source #[0-9]+$/ {
+			emit()
+			source = 1; name = ""; description = ""; monitor = ""; monitor_seen = 0
+			next
+		}
+		/^[\t ]*Name: / { name = $0; sub(/^[\t ]*Name: /, "", name) }
+		/^[\t ]*Description: / { description = $0; sub(/^[\t ]*Description: /, "", description) }
+		/^[\t ]*Monitor of Sink: / { monitor = $0; sub(/^[\t ]*Monitor of Sink: /, "", monitor); monitor_seen = 1 }
+		END { emit() }
+	' <<< "$sources") || return 1
+	while IFS=$'\t' read -r identity label; do
+		[[ -n $identity ]] || continue
+		if ! tg_media_valid_microphone "$identity"; then
+			printf 'Skipping a microphone with an unsupported source name.\n' >&2
+			continue
+		fi
+		if [[ ${groups[$identity]+present} ]]; then
+			index=${groups[$identity]}
+			TG_MICROPHONES_LABELS[index]=$label
+			TG_MICROPHONES_CONNECTED[index]=yes
+		else
+			groups[$identity]=${#TG_MICROPHONES_IDS[@]}
+			TG_MICROPHONES_IDS+=("$identity")
+			TG_MICROPHONES_LABELS+=("$label")
+			TG_MICROPHONES_CONNECTED+=(yes)
+			TG_MICROPHONES_SELECTED+=(no)
+		fi
+	done <<< "$rows"
+}
+
+tg_microphones_show() {
+	local index mark state
+	printf '\nMicrophone access: %s\n' "$TG_MICROPHONE_MODE"
+	[[ $TG_MICROPHONE_MODE != all ]] || printf 'All microphones are allowed.\n'
+	if (( ${#TG_MICROPHONES_IDS[@]} == 0 )); then
+		printf 'No configured or connected microphones.\n'
+	fi
+	for index in "${!TG_MICROPHONES_IDS[@]}"; do
+		mark=' '
+		[[ $TG_MICROPHONE_MODE == all || ( $TG_MICROPHONE_MODE == selected && ${TG_MICROPHONES_SELECTED[index]} == yes ) ]] && mark=x
+		state=disconnected
+		[[ ${TG_MICROPHONES_CONNECTED[index]} != yes ]] || state=connected
+		printf '  %s. [%s] %s (%s)\n     %s\n' "$((index + 1))" "$mark" "${TG_MICROPHONES_LABELS[index]}" "$state" "${TG_MICROPHONES_IDS[index]}"
+	done
+}
+
+tg_microphones_choose() {
+	local answer number index limit valid
+	local -a words=() choices=()
+	local -A seen=()
+	tg_microphones_discover || return 1
+	while true; do
+		tg_microphones_show
+		printf "Enter 'all', 'none', or the microphone numbers to allow (space separated).\n"
+		read -r -p 'Microphone choice (Enter keeps current): ' answer || return 1
+		answer=${answer#"${answer%%[![:space:]]*}"}
+		answer=${answer%"${answer##*[![:space:]]}"}
+		case ${answer,,} in
+			'') return 0 ;;
+			all|none)
+				TG_MICROPHONE_MODE=${answer,,}
+				TG_MICROPHONE_IDS=()
+				return 0 ;;
+		esac
+		read -r -a words <<< "${answer//,/ }"
+		choices=()
+		seen=()
+		valid=yes
+		limit=${#TG_MICROPHONES_IDS[@]}
+		for number in "${words[@]}"; do
+			if [[ ! $number =~ ^[1-9][0-9]*$ || ${#number} -gt ${#limit} ]] || (( number > limit )); then
+				valid=no
+				break
+			fi
+			index=$((number - 1))
+			if [[ ! ${seen[$index]+present} ]]; then choices+=("$index"); seen[$index]=1; fi
+		done
+		if [[ $valid != yes ]] || (( ${#choices[@]} == 0 )); then
+			printf 'Choose displayed microphone numbers, all, or none.\n' >&2
+			continue
+		fi
+		TG_MICROPHONE_MODE=selected
+		TG_MICROPHONE_IDS=()
+		for index in "${choices[@]}"; do
+			TG_MICROPHONE_IDS+=("${TG_MICROPHONES_IDS[index]}")
+		done
+		return 0
+	done
+}
+
 tg_media_video_node() {
 	local node major
 	node=$(readlink -e -- "$1") || return 1
@@ -145,16 +278,8 @@ tg_media_choose() {
 		done
 		break
 	done
-	while true; do
-		read -r -p "Allow microphone input? [yes/no] (Enter keeps $TG_MICROPHONE): " answer || return 1
-		case ${answer,,} in
-			'') break ;;
-			y|yes) TG_MICROPHONE=yes; break ;;
-			n|no) TG_MICROPHONE=no; break ;;
-			*) printf 'Enter yes or no.\n' >&2 ;;
-		esac
-	done
-	printf 'Selected camera access: %s. Microphone input: %s. Audio playback remains available.\n' "$TG_CAMERA_MODE" "$TG_MICROPHONE"
+	tg_microphones_choose || return 1
+	printf 'Selected camera access: %s. Microphone access: %s. Audio playback remains available.\n' "$TG_CAMERA_MODE" "$TG_MICROPHONE_MODE"
 }
 
 tg_media_resolve() {

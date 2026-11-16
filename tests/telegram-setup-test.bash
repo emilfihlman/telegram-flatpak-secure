@@ -16,7 +16,7 @@ mkdir -p -- "$TG_RUNTIME" "$TG_INSTALL_DIR" "$TG_DATA/TelegramDesktop/tdata" "$T
 tg_config_defaults
 TG_PULSE_SOCKET=$TG_RUNTIME/pulse/native
 TG_CAMERA_MODE=none
-TG_MICROPHONE=no
+TG_MICROPHONE_MODE=none
 tg_config_save
 for file in telegram-common.bash telegram-media.bash telegram-audio.bash telegram-bwrap.bash telegram-run.bash config-path; do
 	printf '# old wrapper file\n' > "$TG_INSTALL_DIR/$file"
@@ -65,7 +65,7 @@ tg_setup_stage
 tg_setup_commit
 tg_setup_cleanup
 tg_config_load required
-[[ $TG_CAMERA_MODE == all && $TG_MICROPHONE == no ]]
+[[ $TG_CAMERA_MODE == all && $TG_MICROPHONE_MODE == none ]]
 cmp -s telegram-run.bash "$TG_INSTALL_DIR/telegram-run.bash"
 [[ ! -e $TG_SETUP_WORK ]]
 # A signal immediately after the atomic directory exchange follows the same

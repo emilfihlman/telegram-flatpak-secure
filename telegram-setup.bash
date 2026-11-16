@@ -50,6 +50,46 @@ tg_native_profile_available() {
 	done < <(pgrep -u "$UID" -x Telegram || :)
 }
 
+tg_setup_audio_runtime() {
+	# Keep the desktop's PipeWire packages and services. Only selected-input
+	# mode needs this private native broker when PulseAudio is not installed.
+	[[ $TG_MICROPHONE_MODE == selected ]] || return 0
+	! command -v pulseaudio >/dev/null || return 0
+	local version dependency runtime=$TG_SETUP_WORK/programs/pulseaudio unpack=$TG_SETUP_WORK/audio-package
+	local -a packages modules libraries
+	tg_packages_update || return 1
+	version=$(LC_ALL=C apt-cache policy pulseaudio | awk '/Candidate:/ { print $2; exit }') || return 1
+	[[ -n $version && $version != '(none)' ]] || { tg_error 'No native PulseAudio broker package is available.'; return 1; }
+	if tg_audio_runtime_owned "$TG_INSTALL_DIR/pulseaudio" && [[ -f $TG_INSTALL_DIR/pulseaudio/version && -f $TG_INSTALL_DIR/pulseaudio/dependencies && -x $TG_INSTALL_DIR/pulseaudio/bin/pulseaudio &&
+		$(cat "$TG_INSTALL_DIR/pulseaudio/version") == "$version" ]]; then
+		dependency=$(cat "$TG_INSTALL_DIR/pulseaudio/dependencies") || return 1
+		sudo apt-get satisfy --no-remove --no-install-recommends -y "$dependency" || return 1
+		cp -a --reflink=auto -- "$TG_INSTALL_DIR/pulseaudio" "$runtime" || return 1
+		if (source "$TG_SETUP_WORK/programs/telegram-audio.bash"; tg_audio_supported); then return 0; fi
+		# A broken disposable runtime must not be reused on every repair attempt.
+		rm -rf -- "$runtime" || return 1
+	fi
+	printf '\nPreparing the private microphone broker...\n'
+	(cd -- "$TG_SETUP_WORK" && apt-get download "pulseaudio=$version") || return 1
+	packages=("$TG_SETUP_WORK"/pulseaudio_*.deb)
+	[[ ${#packages[@]} == 1 && -f ${packages[0]} ]] || return 1
+	dependency=$(dpkg-deb -f "${packages[0]}" Depends) || return 1
+	sudo apt-get satisfy --no-remove --no-install-recommends -y "$dependency" || return 1
+	dpkg-deb -x "${packages[0]}" "$unpack" || return 1
+	modules=("$unpack"/usr/lib/pulse-*/modules)
+	libraries=("$unpack"/usr/lib/*/pulseaudio/libpulsecore-*.so)
+	[[ ${#modules[@]} == 1 && -d ${modules[0]} && ${#libraries[@]} == 1 && -f ${libraries[0]} ]] || return 1
+	mkdir -p -- "$runtime/bin" "$runtime/lib" || return 1
+	install -m 755 -- "$unpack/usr/bin/pulseaudio" "$runtime/bin/pulseaudio" || return 1
+	cp -a -- "${modules[0]}" "$runtime/modules" || return 1
+	install -m 644 -- "${libraries[0]}" "$runtime/lib/" || return 1
+	printf '%s\n' "$version" > "$runtime/version" || return 1
+	printf '%s\n' "$dependency" > "$runtime/dependencies" || return 1
+	printf 'telegram-flatpak-secure\n' > "$runtime/owner" || return 1
+	# Keep only the runtime used by the launcher, not package/config/service files.
+	rm -rf -- "$unpack" "${packages[0]}"
+}
+
 tg_setup_stage() {
 	local file
 	mkdir -p -- "$TG_DATA"
@@ -61,6 +101,7 @@ tg_setup_stage() {
 		bash -n "$source_dir/$file" || return 1
 		install -m 755 -- "$source_dir/$file" "$TG_SETUP_WORK/programs/$file" || return 1
 	done
+	tg_setup_audio_runtime || return 1
 	(
 		TG_CONFIG=$TG_SETUP_WORK/config/telegram-sandbox
 		TG_CONFIG_FILE=$TG_CONFIG/settings
@@ -73,6 +114,8 @@ tg_setup_stage() {
 		for file in "$TG_INSTALL_DIR"/* "$TG_INSTALL_DIR"/.[!.]* "$TG_INSTALL_DIR"/..?*; do
 			[[ -e $file || -L $file ]] || continue
 			case ${file##*/} in
+				pulseaudio)
+					tg_audio_runtime_owned "$file" || { tg_error "Unexpected wrapper runtime: $file"; return 1; } ;;
 				telegram-common.bash|telegram-media.bash|telegram-audio.bash|telegram-bwrap.bash|telegram-run.bash|config-path)
 					[[ -f $file && ! -L $file ]] || { tg_error "Unexpected wrapper file: $file"; return 1; } ;;
 				*) tg_error "Unrelated file in wrapper directory: $file"; return 1 ;;
@@ -211,6 +254,7 @@ main() {
 		tg_error 'Open a terminal in your graphical desktop session.'; return 1;
 	}
 	TG_RUNTIME=$desktop_runtime
+	tg_dependencies
 	tg_profile_choose
 	tg_media_choose
 	tg_dependencies
@@ -225,11 +269,6 @@ main() {
 	tg_policy_args
 	flatpak run "${TG_FLATPAK_ARGS[@]}" --help >/dev/null
 	bwrap --unshare-user --bind / / --dev /dev -- /usr/bin/true
-	if [[ $TG_MICROPHONE == no ]]; then
-		# shellcheck source=telegram-audio.bash
-		source "$source_dir/telegram-audio.bash"
-		tg_audio_supported || { tg_error 'The installed audio server cannot provide microphone blocking.'; return 1; }
-	fi
 	printf '\nInstalling/updating Telegram...\n'
 	flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 	tg_remote_check

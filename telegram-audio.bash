@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A private native Pulse server withholds microphones and retains playback.
+# A private native audio server exposes approved inputs and retains playback.
 
 tg_audio_close_fds() {
 	local descriptor
@@ -13,16 +13,32 @@ tg_audio_close_fds() {
 }
 
 tg_audio_supported() {
-	local module modules
+	local module modules private=${BASH_SOURCE[0]%/*}/pulseaudio
+	TG_AUDIO_BINARY=
+	TG_AUDIO_PULSE_ARGS=()
+	TG_AUDIO_PRIVATE=
 	command -v setpriv >/dev/null && command -v setsid >/dev/null || return 1
 	if command -v pulseaudio >/dev/null; then
-		modules=$(pulseaudio --dump-modules) || return 1
-		for module in module-native-protocol-unix module-tunnel-sink-new module-null-source module-cli; do
+		TG_AUDIO_BINARY=$(command -v pulseaudio)
+	elif [[ ${TG_MICROPHONE_MODE:-none} == selected && -x $private/bin/pulseaudio ]]; then
+		TG_AUDIO_BINARY=$private/bin/pulseaudio
+		TG_AUDIO_PRIVATE=$private
+		TG_AUDIO_PULSE_ARGS=("--dl-search-path=$private/modules")
+	fi
+	if [[ -n $TG_AUDIO_BINARY ]]; then
+		if [[ -n $TG_AUDIO_PRIVATE ]]; then
+			modules=$(LD_BIND_NOW=1 LD_LIBRARY_PATH=$private/lib "$TG_AUDIO_BINARY" "${TG_AUDIO_PULSE_ARGS[@]}" --dump-modules) || return 1
+		else
+			modules=$("$TG_AUDIO_BINARY" --dump-modules) || return 1
+		fi
+		for module in module-native-protocol-unix module-tunnel-sink-new module-null-source module-cli module-suspend-on-idle module-switch-on-connect; do
 			[[ $modules =~ (^|$'\n')${module}[[:space:]] ]] || return 1
 		done
 		TG_AUDIO_PROVIDER=pulseaudio
+		if [[ ${TG_MICROPHONE_MODE:-none} == selected && ! $modules =~ (^|$'\n')module-tunnel-source-new[[:space:]] ]]; then return 1; fi
 		return 0
 	fi
+	[[ ${TG_MICROPHONE_MODE:-none} != selected ]] || return 1
 	command -v pipewire >/dev/null || return 1
 	# Unknown quirks are ignored by PipeWire. Check this installed capability
 	# before relying on it; this project installs Debian's native packages.
@@ -50,7 +66,9 @@ tg_audio_stop() {
 }
 
 tg_audio_start() {
-	local notification_fd input_fd _ready host_socket status
+	local notification_fd input_fd _ready host_socket status index identity description properties
+	local started=$SECONDS remaining silence=telegram-silence
+	local -A selected_names=()
 	TG_AUDIO_PID=
 	TG_AUDIO_DIR=
 	TG_AUDIO_SOCKET=
@@ -67,11 +85,29 @@ tg_audio_start() {
 		# PulseAudio startup syntax quotes backslashes and double quotes.
 		host_socket=${TG_PULSE_SOCKET//\\/\\\\}
 		host_socket=${host_socket//\"/\\\"}
+		if [[ ${TG_MICROPHONE_MODE:-none} == selected ]]; then
+			tg_microphones_discover "$TG_PULSE_SOCKET" || { tg_audio_stop; return 1; }
+			for identity in "${TG_MICROPHONE_IDS[@]}"; do selected_names[$identity]=1; done
+			while [[ ${selected_names[$silence]+present} ]]; do silence+=_; done
+		fi
 		{
 			printf '.fail\n'
+			printf 'load-module module-suspend-on-idle timeout=0\n'
+			printf 'load-module module-switch-on-connect ignore_virtual=false blacklist=^$\n'
 			printf 'load-module module-tunnel-sink-new server="unix:%s" sink_name=telegram-playback reconnect_interval_ms=1000\n' "$host_socket"
-			printf 'load-module module-null-source source_name=telegram-silence\n'
-			printf 'set-default-source telegram-silence\n'
+			printf 'load-module module-null-source source_name=%s\n' "$silence"
+			printf 'set-default-source %s\n' "$silence"
+			if [[ ${TG_MICROPHONE_MODE:-none} == selected ]]; then
+				for index in "${!TG_MICROPHONES_IDS[@]}"; do
+					[[ ${TG_MICROPHONES_SELECTED[index]} == yes && ${TG_MICROPHONES_CONNECTED[index]} == yes ]] || continue
+					identity=${TG_MICROPHONES_IDS[index]}
+					description=${TG_MICROPHONES_LABELS[index]//\\/ }
+					description=${description//\'/}
+					description=${description//\"/}
+					properties="device.description='$description'"
+					printf 'load-module module-tunnel-source-new server="unix:%s" source="%s" source_name="%s" source_properties="%s" reconnect_interval_ms=1000\n' "$host_socket" "$identity" "$identity" "$properties"
+				done
+			fi
 			printf 'load-module module-native-protocol-unix socket=native auth-anonymous=true auth-cookie-enabled=false\n'
 			# Only the launcher owns this inherited readiness pipe. It has no
 			# socket, and unloads itself when the launcher closes the pipe.
@@ -113,13 +149,17 @@ EOF
 		export XDG_RUNTIME_DIR=$TG_RUNTIME
 		export PULSE_RUNTIME_PATH=$TG_AUDIO_DIR
 		if [[ $TG_AUDIO_PROVIDER == pulseaudio ]]; then
+			# These stream properties prevent the desktop PipeWire policy from
+			# substituting another source if an approved microphone disappears.
+			export PULSE_PROP='node.dont-fallback=true node.dont-move=true'
+			if [[ -n $TG_AUDIO_PRIVATE ]]; then export LD_BIND_NOW=1 LD_LIBRARY_PATH=$TG_AUDIO_PRIVATE/lib; fi
 			export PULSE_STATE_PATH=$TG_AUDIO_DIR
 			# libpulse may create a missing cookie, so keep its temporary
 			# authentication data here too. Host Unix auth uses peer UID.
 			export PULSE_COOKIE=$TG_AUDIO_DIR/cookie
 			export DBUS_SESSION_BUS_ADDRESS=unix:path=$TG_AUDIO_DIR/no-session-bus
 			# A new session prevents module-cli from opening the user's tty.
-			exec setpriv --pdeathsig TERM -- setsid pulseaudio --daemonize=no --use-pid-file=no \
+			exec setpriv --pdeathsig TERM -- setsid "$TG_AUDIO_BINARY" "${TG_AUDIO_PULSE_ARGS[@]}" --daemonize=no --use-pid-file=no \
 				--disallow-module-loading=yes --disallow-exit=yes --exit-idle-time=-1 \
 				--fail=yes --log-target=stderr --log-level=error -n -F "$TG_AUDIO_DIR/telegram-audio.pa"
 		else
@@ -150,7 +190,8 @@ EOF
 	fi
 	# This is the small native broker's readiness deadline, independent of
 	# package downloads, Telegram startup, or application file loading.
-	if IFS= read -r -t 60 -u "$notification_fd" _ready; then
+	remaining=$((60 - (SECONDS - started)))
+	if (( remaining > 0 )) && IFS= read -r -t "$remaining" -u "$notification_fd" _ready; then
 		:
 	else
 		status=$?
@@ -162,7 +203,7 @@ EOF
 		[[ -z $input_fd ]] || exec {input_fd}>&-
 		exec {notification_fd}<&-
 		tg_audio_stop
-		printf 'The private playback-only Pulse server failed to start.\n' >&2
+		printf 'The private restricted audio server failed to start.\n' >&2
 		return 1
 	fi
 	if [[ $TG_AUDIO_PROVIDER == pulseaudio ]]; then exec {input_fd}>&-; fi

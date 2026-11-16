@@ -16,7 +16,7 @@ tg_check_probe() (
 	# Flatpak may supply a per-app Wayland proxy, so socket identity can differ.
 	[[ ! -S $wayland_socket ]] || wayland_available=yes
 	socket_id=
-	if [[ $TG_MICROPHONE == yes ]]; then
+	if [[ $TG_MICROPHONE_MODE == all ]]; then
 		socket_id=$(stat -Lc '%d:%i' -- "$TG_PULSE_SOCKET") || return 1
 	fi
 	tg_media_resolve || return 1
@@ -33,7 +33,7 @@ shift 5
 [ "${QT_QPA_PLATFORM:-}" = 'wayland;xcb' ] || fail 'Unexpected Qt display selection.'
 [ "${PULSE_SERVER:-}" = unix:/run/flatpak/pulse/native ] || fail 'Unexpected audio endpoint.'
 [ -S /run/flatpak/pulse/native ] || fail 'Approved audio socket is missing.'
-# The hook starts microphone-blocked audio for this sandbox and supplies the
+# The hook starts restricted audio for this sandbox and supplies the
 # approved socket's host identity. Direct microphone access has a saved endpoint.
 [ -n "$socket_id" ] || socket_id=${TELEGRAM_AUDIO_SOCKET_ID:-}
 [ "$(stat -Lc '%d:%i' /run/flatpak/pulse/native)" = "$socket_id" ] || fail 'Audio socket does not match the approved endpoint.'

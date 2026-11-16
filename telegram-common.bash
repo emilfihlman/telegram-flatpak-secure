@@ -31,7 +31,8 @@ tg_config_defaults() {
 	TG_CAMERA_MODE=none
 	TG_CAMERA_KINDS=()
 	TG_CAMERA_IDS=()
-	TG_MICROPHONE=yes
+	TG_MICROPHONE_MODE=all
+	TG_MICROPHONE_IDS=()
 	TG_PROFILE=flatpak
 	TG_NATIVE_PROFILE=$TG_DATA/TelegramDesktop
 	TG_PULSE_SOCKET=$TG_RUNTIME/pulse/native
@@ -58,18 +59,20 @@ tg_config_load() {
 	tg_config_defaults
 	if [[ ! -e $TG_CONFIG_FILE ]]; then [[ ${1:-new} != required ]]; return; fi
 	[[ -f $TG_CONFIG_FILE && ! -L $TG_CONFIG_FILE ]] || return 1
-	local key first second extra
+	local key first second extra identity
+	local -a microphones=()
 	local -A seen=()
 	while IFS=$'\t' read -r key first second extra || [[ -n $key ]]; do
 		[[ -n $key && $key != \#* ]] || continue
 		[[ -z $extra ]] || return 1
-		if [[ $key != camera ]]; then
+		if [[ $key != camera && $key != microphone ]]; then
 			[[ ! ${seen[$key]+set} && -z $second ]] || return 1
 			seen[$key]=1
 		fi
 		case $key in
 			camera-mode) [[ $first == all || $first == selected || $first == none ]] || return 1; TG_CAMERA_MODE=$first ;;
-			microphone) [[ $first == yes || $first == no ]] || return 1; TG_MICROPHONE=$first ;;
+			microphone-mode) [[ $first == all || $first == selected || $first == none ]] || return 1; TG_MICROPHONE_MODE=$first ;;
+			microphone) [[ -n $first && -z $second ]] || return 1; microphones+=("$first") ;;
 			profile) [[ $first == flatpak || $first == native ]] || return 1; TG_PROFILE=$first ;;
 			native-profile) tg_plain_path "$first" || return 1; TG_NATIVE_PROFILE=$first ;;
 			runtime) tg_plain_path "$first" || return 1; TG_RUNTIME=$first ;;
@@ -80,22 +83,57 @@ tg_config_load() {
 			*) return 1 ;;
 		esac
 	done < "$TG_CONFIG_FILE"
-	for key in camera-mode microphone profile native-profile runtime pulse-socket; do
+	for key in camera-mode profile native-profile runtime pulse-socket; do
 		[[ ${seen[$key]+set} ]] || return 1
 	done
+	if [[ ! ${seen[microphone-mode]+set} ]]; then
+		# Existing yes/no settings keep their meaning until the next save.
+		(( ${#microphones[@]} == 1 )) || return 1
+		case ${microphones[0]} in
+			yes) TG_MICROPHONE_MODE=all ;;
+			no) TG_MICROPHONE_MODE=none ;;
+			*) return 1 ;;
+		esac
+	else
+		for identity in "${microphones[@]}"; do
+			tg_media_valid_microphone "$identity" || return 1
+			[[ ! ${seen[microphone/$identity]+set} ]] || return 1
+			seen[microphone/$identity]=1
+			TG_MICROPHONE_IDS+=("$identity")
+		done
+		if [[ $TG_MICROPHONE_MODE == selected ]]; then
+			(( ${#TG_MICROPHONE_IDS[@]} > 0 )) || return 1
+		else
+			(( ${#TG_MICROPHONE_IDS[@]} == 0 )) || return 1
+		fi
+	fi
 }
 
 tg_config_save() (
-	local temporary index
+	local temporary index identity
+	local -A seen_microphones=()
 	tg_plain_path "$TG_NATIVE_PROFILE" && tg_plain_path "$TG_RUNTIME" && tg_plain_path "$TG_PULSE_SOCKET" || return 1
+	case $TG_MICROPHONE_MODE in
+		selected) (( ${#TG_MICROPHONE_IDS[@]} > 0 )) || return 1 ;;
+		all|none) (( ${#TG_MICROPHONE_IDS[@]} == 0 )) || return 1 ;;
+		*) return 1 ;;
+	esac
+	for identity in "${TG_MICROPHONE_IDS[@]}"; do
+		tg_media_valid_microphone "$identity" || return 1
+		[[ ! ${seen_microphones[$identity]+set} ]] || return 1
+		seen_microphones[$identity]=1
+	done
 	mkdir -p -- "$TG_CONFIG" || return 1
 	temporary=$(mktemp "$TG_CONFIG/.telegram-settings.XXXXXX") || return 1
 	trap 'rm -f -- "$temporary"' EXIT
 	{
-		printf 'camera-mode\t%s\nmicrophone\t%s\nprofile\t%s\n' "$TG_CAMERA_MODE" "$TG_MICROPHONE" "$TG_PROFILE"
+		printf 'camera-mode\t%s\nmicrophone-mode\t%s\nprofile\t%s\n' "$TG_CAMERA_MODE" "$TG_MICROPHONE_MODE" "$TG_PROFILE"
 		printf 'native-profile\t%s\nruntime\t%s\npulse-socket\t%s\n' "$TG_NATIVE_PROFILE" "$TG_RUNTIME" "$TG_PULSE_SOCKET"
 		for index in "${!TG_CAMERA_IDS[@]}"; do
 			printf 'camera\t%s\t%s\n' "${TG_CAMERA_KINDS[index]}" "${TG_CAMERA_IDS[index]}"
+		done
+		for identity in "${TG_MICROPHONE_IDS[@]}"; do
+			printf 'microphone\t%s\n' "$identity"
 		done
 	} > "$temporary" || return 1
 	if cmp -s -- "$temporary" "$TG_CONFIG_FILE"; then return 0; fi
@@ -156,15 +194,25 @@ tg_dependencies() {
 		*:KDE:*) packages+=(xdg-desktop-portal-kde) ;;
 		*) packages+=(xdg-desktop-portal-gtk) ;;
 	esac
-	if [[ $TG_MICROPHONE == no ]] && ! command -v pulseaudio >/dev/null; then packages+=(pipewire-bin libpipewire-0.3-modules); fi
+	if [[ $TG_MICROPHONE_MODE == none ]] && ! command -v pulseaudio >/dev/null; then packages+=(pipewire-bin libpipewire-0.3-modules); fi
 	for package in "${packages[@]}"; do
 		state=$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null) || state=
 		[[ $state == 'install ok installed' ]] || missing+=("$package")
 	done
 	if (( ${#missing[@]} )); then
 		printf 'Installing required packages: %s\n' "${missing[*]}"
-		sudo apt-get update && sudo apt-get install --no-install-recommends -y -- "${missing[@]}" || return 1
+		tg_packages_update && sudo apt-get install --no-remove --no-install-recommends -y -- "${missing[@]}" || return 1
 	fi
+}
+
+tg_packages_update() {
+	[[ ${TG_PACKAGES_CURRENT:-no} != yes ]] || return 0
+	sudo apt-get update || return 1
+	TG_PACKAGES_CURRENT=yes
+}
+
+tg_audio_runtime_owned() {
+	[[ -d $1 && ! -L $1 && -f $1/owner && ! -L $1/owner && $(cat "$1/owner") == telegram-flatpak-secure ]]
 }
 
 tg_stop() {
@@ -194,6 +242,9 @@ tg_remove_files() {
 	for file in telegram-run.bash telegram-bwrap.bash telegram-common.bash telegram-media.bash telegram-audio.bash config-path; do
 		[[ ! -f $TG_INSTALL_DIR/$file && ! -L $TG_INSTALL_DIR/$file ]] || rm -- "$TG_INSTALL_DIR/$file" || return 1
 	done
+	if tg_audio_runtime_owned "$TG_INSTALL_DIR/pulseaudio"; then
+		rm -rf -- "$TG_INSTALL_DIR/pulseaudio" || return 1
+	fi
 	if [[ -e $TG_CONFIG_FILE || -L $TG_CONFIG_FILE ]]; then rm -- "$TG_CONFIG_FILE" || return 1; fi
 	rmdir -- "$TG_INSTALL_DIR" "$TG_CONFIG" 2>/dev/null || :
 }
